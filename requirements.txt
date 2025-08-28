@@ -1,4 +1,2 @@
 mujoco-mjx==3.3.5
--f https://download.pytorch.org/whl/cu129
-torch==2.8.0+cu129
 jax[cuda12]==0.6.2
