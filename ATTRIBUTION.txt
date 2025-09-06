@@ -20,7 +20,11 @@ This software is provided "as-is", without any warranty of any kind.
 ------------------------------------------------------------
 
 Files derived from https://github.com/HybridRobotics/cassie_rl_walking:
-- cassie_env.py
+- cassie_arl/rlenv/cassie_env.py
+- cassie_arl/rlenv/domain_randomizer.py
+- cassie_arl/rlenv/action_filter.py
+- cassie_arl/rlenv/cassie_fk.py
+- cassie_arl/config/defaults.py
 
 Notes:
 - Any derivative work must retain this attribution and the same license (CC BY-NC-SA 4.0) for the adapted portions.

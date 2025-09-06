@@ -77,20 +77,23 @@ if "network_factory" in ppo_params:
 # ppo_training_params["episode_length"] = 2
 # ppo_training_params["num_envs"] = 64
 # ppo_training_params["num_minibatches"] = 4
-ppo_training_params["num_timesteps"] = 75_000_000
+ppo_training_params["num_timesteps"] = 500_000
 
 print("[INFO] PPO training parameters:")
 print(ppo_training_params)
 
-save_ckpt_path = script_dir / "checkpoints" / f"{env_name}_ppo"
-print(f"[INFO] Checkpoints will be saved to {save_ckpt_path}")
+save_ckpt_dir = script_dir / "checkpoints" / f"{env_name}_ppo"
+print(f"[INFO] Checkpoints will be saved to {save_ckpt_dir}")
+
+restore_ckpt_path = save_ckpt_dir / "000075694080"
 
 train_fn = functools.partial(
     ppo.train, **dict(ppo_training_params),
     network_factory=network_factory,
     randomization_fn=randomizer,
     progress_fn=progress,
-    save_checkpoint_path=str(save_ckpt_path)
+    save_checkpoint_path=str(save_ckpt_dir),
+    restore_checkpoint_path=str(restore_ckpt_path)
 )
 
 # Start training
@@ -198,6 +201,7 @@ ani = animation.FuncAnimation(
 )
 
 # ---- Save as MP4 ----
-ani.save(f"{script_dir}/simulation.mp4", writer='ffmpeg', fps=fps)
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+ani.save(f"{script_dir}/simulation-{timestamp}.mp4", writer='ffmpeg', fps=fps)
 print("[INFO] Saved video to simulation.mp4")
 

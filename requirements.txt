@@ -6,4 +6,4 @@ matplotlib==3.10.6
 mujoco-mjx==3.3.5
 orbax-checkpoint==0.11.24
 playground==0.0.5
-
+gymnasium==1.2.0

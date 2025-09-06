@@ -1,3 +1,7 @@
 .venv/
 *.mp4
 checkpoints/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
