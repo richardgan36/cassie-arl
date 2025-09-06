@@ -1,0 +1,26 @@
+ATTRIBUTION FOR THIRD-PARTY CODE
+
+This project uses code and/or ideas from the following source(s):
+
+------------------------------------------------------------
+Original Work:
+Li, Z., Peng, X. B., Abbeel, P., Levine, S., Berseth, G., & Sreenath, K. (2024).
+"Reinforcement learning for versatile, dynamic, and robust bipedal locomotion control".
+The International Journal of Robotics Research, SAGE Publications.
+
+Original code repository:
+https://github.com/HybridRobotics/cassie_rl_walking
+
+Copyright (c) 2024 Li et al.
+Licensed under Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0)
+License details: https://creativecommons.org/licenses/by-nc-sa/4.0/
+
+Disclaimer:
+This software is provided "as-is", without any warranty of any kind.
+------------------------------------------------------------
+
+Files derived from https://github.com/HybridRobotics/cassie_rl_walking:
+- cassie_env.py
+
+Notes:
+- Any derivative work must retain this attribution and the same license (CC BY-NC-SA 4.0) for the adapted portions.
