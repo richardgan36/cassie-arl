@@ -1,6 +1,8 @@
 .venv/
 *.mp4
 checkpoints/
+progress/
+simulation/
 
 # Python bytecode
 __pycache__/

@@ -2,10 +2,10 @@ import jax
 from mujoco import mjx
 
 FLOOR_GEOM_ID = 0
-TORSO_BODY_ID = 1
+PELVIS_ID = 1
 
 
-def domain_randomize(model: mjx.Model, rng: jax.Array):
+def domain_randomize(model: mjx.Model, rng: jax.Array) -> tuple[mjx.Model, mjx.Model]:
     @jax.vmap
     def rand_dynamics(rng):
         # Floor friction: =U(0.4, 1.0).
@@ -38,8 +38,8 @@ def domain_randomize(model: mjx.Model, rng: jax.Array):
         # Add mass to torso: +U(-1.0, 1.0).
         rng, key = jax.random.split(rng)
         dmass = jax.random.uniform(key, minval=-1.0, maxval=1.0)
-        body_mass = body_mass.at[TORSO_BODY_ID].set(
-                body_mass[TORSO_BODY_ID] + dmass
+        body_mass = body_mass.at[PELVIS_ID].set(
+                body_mass[PELVIS_ID] + dmass
         )
 
         # Jitter qpos0: +U(-0.05, 0.05).
