@@ -1,9 +1,16 @@
+# Directories
 .venv/
-*.mp4
 checkpoints/
 progress/
 simulation/
 
+# Third-party Cassie code
+hybridrobotics/
+icepomel0/
+
 # Python bytecode
 __pycache__/
 *.py[cod]
+
+# Large files
+*.mp4

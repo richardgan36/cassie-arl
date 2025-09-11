@@ -3,8 +3,9 @@ from pathlib import Path
 
 import jax
 import jax.numpy as jnp
-import mujoco
+import mujoco as mj
 import mujoco.mjx as mjx
+from absl import logging
 from ml_collections import config_dict
 from mujoco_playground._src import mjx_env
 
@@ -18,23 +19,41 @@ CASSIE_SCENE_XML = script_dir / ".." / "models" / "scene.xml"
 
 def default_config() -> config_dict.ConfigDict:
     return config_dict.create(
+        # --------------------------------
+        # Required simulation parameters
+        # --------------------------------
         ctrl_dt=0.02,
         sim_dt=0.002,
-        episode_length=1000,
+        episode_length=1000,  # 20 seconds at ctrl_dt=0.02
         action_repeat=1,
-        action_scale=0.5,
         history_len=1,
-        soft_joint_pos_limit_factor=0.95,
+
+        # -------------------
+        # Custom parameters
+        # -------------------
+
+        # PD gains for the 10 actuated joints
+        # Values are from Z Li et al. 2024 but scaled down to avoid excessive saturation
+        # TODO: ckeck these: right now the torques are always saturated
+        p_gain = jnp.array([
+            8, 4, 4, 10, 0.4,
+            8, 4, 4, 10, 0.4
+        ]),
+        d_gain = jnp.array([
+            0.08, 0.08, 0.2, 0.4, 0.08,
+            0.08, 0.08, 0.2, 0.0, 0.08
+        ]),
+        pd_uncertainty=0.1,  # ±10% uniform randomization of PD gains per episode
+        
+        # Soft joint limits as a fraction of total joint range
+        # (1.0 = full range, 0.0 = no movement allowed)
+        soft_joint_pos_limit_factors=jnp.array([
+            0.5, 0.8, 0.95, 0.95, 0.95,  # L_HIP_ROLL, L_HIP_YAW, L_HIP_PITCH, L_KNEE, L_FOOT
+            0.5, 0.8, 0.95, 0.95, 0.95   # R_HIP_ROLL, R_HIP_YAW, R_HIP_PITCH, R_KNEE, R_FOOT
+        ]),
         noise_config=config_dict.create(
             level=1.0,  # Set to 0.0 to disable noise.
-            scales=config_dict.create(
-                hip_pos=0.03,  # rad
-                kfe_pos=0.05,
-                ffe_pos=0.08,
-                faa_pos=0.03,
-                joint_vel=1.5,  # rad/s
-                gravity=0.05,
-                linvel=0.1,
+            scales=config_dict.create(  # TODO: define scale of noise for each joint
                 gyro=0.2,  # angvel.
             ),
         ),
@@ -42,18 +61,19 @@ def default_config() -> config_dict.ConfigDict:
             scales=config_dict.create(
                 alive=1.0,
                 pelvis_lin_vel=-0.7,
-                pelvis_orientation=-0.5,
-                motor_ref_error=-0.6
+                pelvis_tilt=-0.5,
+                motor_ref_error=-0.3
             ),
         ),
-        lin_vel_x=[-1.0, 1.0],
-        lin_vel_y=[-1.0, 1.0],
-        ang_vel_yaw=[-1.0, 1.0],
     )
 
 
 class CassieEnv(mjx_env.MjxEnv):
     """Cassie environment built on MJX, compatible with Brax PPO."""
+    # TODO: consider implementing render method (see if the base render method is enough)
+    # TODO: replace manual rendering in train_cassie with render method for better debugging
+    # TODO: add random pushes to improve robustness
+    # TODO: add metrics
 
     def __init__(
             self,
@@ -64,7 +84,7 @@ class CassieEnv(mjx_env.MjxEnv):
         super().__init__(config, config_overrides)
         # Load MuJoCo model and MJX version
         self._xml_path = xml_path
-        self._mj_model = mujoco.MjModel.from_xml_path(self._xml_path)
+        self._mj_model = mj.MjModel.from_xml_path(self._xml_path)
         self._mjx_model = mjx.put_model(self._mj_model)
 
         self._mj_model.vis.global_.offwidth = 3840
@@ -73,77 +93,22 @@ class CassieEnv(mjx_env.MjxEnv):
         self._post_init()
 
     def _post_init(self):
-        self._init_q = jnp.array(self._mj_model.keyframe("home").qpos)
+        self._init_qpos = jnp.array(self._mj_model.keyframe("home").qpos)
         self._default_pose = jnp.array(self._mj_model.keyframe("home").qpos[7:])
 
-        # Note: First joint is freejoint.
-        self._jnt_lowers, self._jnt_uppers = self.mj_model.jnt_range[1:].T
+        # Apply soft limits on actuated joints for safe hardware deployment
+        self._jnt_lowers, self._jnt_uppers = self._mj_model.jnt_range[JntRangeIdx.MOTORS].T
         jnt_c = (self._jnt_lowers + self._jnt_uppers) / 2
         jnt_r = self._jnt_uppers - self._jnt_lowers
-        self._jnt_soft_lowers = jnt_c - 0.5 * jnt_r * self._config.soft_joint_pos_limit_factor
-        self._jnt_soft_uppers = jnt_c + 0.5 * jnt_r * self._config.soft_joint_pos_limit_factor
+        self._jnt_soft_lowers = jnt_c - 0.5 * jnt_r * self._config.soft_joint_pos_limit_factors
+        self._jnt_soft_uppers = jnt_c + 0.5 * jnt_r * self._config.soft_joint_pos_limit_factors
 
-        act_ctrl = jnp.array(self._mj_model.actuator_ctrlrange.T)  # shape (2, nu)
-        act_ctrl = act_ctrl.at[:, [LEFT_HIP_ROLL_IDX, RIGHT_HIP_ROLL_IDX]].multiply(0.5)
-        act_ctrl = act_ctrl.at[:, [LEFT_HIP_YAW_IDX, RIGHT_HIP_YAW_IDX]].multiply(0.8)
-        self._actuator_soft_bounds = act_ctrl
+        self._torque_lowers, self._torque_uppers = self._mj_model.actuator_ctrlrange.T
 
         self._pelvis_id = self._mj_model.body("cassie-pelvis").id
 
-        # hip_indices = []
-        # hip_joint_names = ["HR", "HAA"]
-        # for side in ["LL", "LR"]:
-        #     for joint_name in hip_joint_names:
-        #         hip_indices.append(
-        #             self._mj_model.joint(f"{side}_{joint_name}").qposadr - 7
-        #         )
-        # self._hip_indices = jnp.array(hip_indices)
-
-        # knee_indices = []
-        # for side in ["LL", "LR"]:
-        #     knee_indices.append(self._mj_model.joint(f"{side}_KFE").qposadr - 7)
-        # self._knee_indices = jnp.array(knee_indices)
-
-        # # fmt: off
-        # self._weights = jnp.array([
-        #     1.0, 1.0, 0.01, 0.01, 1.0, 1.0,  # left leg.
-        #     1.0, 1.0, 0.01, 0.01, 1.0, 1.0,  # right leg.
-        # ])
-        # # fmt: on
-
-        # self._torso_body_id = self._mj_model.body(ROOT_BODY).id
-        # self._torso_mass = self._mj_model.body_subtreemass[self._torso_body_id]
-        # self._site_id = self._mj_model.site("imu").id
-
-        # self._feet_site_id = np.array(
-        #     [self._mj_model.site(name).id for name in FEET_SITES]
-        # )
-        # self._floor_geom_id = self._mj_model.geom("floor").id
-        # self._feet_geom_id = np.array(
-        #     [self._mj_model.geom(name).id for name in FEET_GEOMS]
-        # )
-
-        # foot_linvel_sensor_adr = []
-        # for site in FEET_SITES:
-        #     sensor_id = self._mj_model.sensor(f"{site}_global_linvel").id
-        #     sensor_adr = self._mj_model.sensor_adr[sensor_id]
-        #     sensor_dim = self._mj_model.sensor_dim[sensor_id]
-        #     foot_linvel_sensor_adr.append(
-        #         list(range(sensor_adr, sensor_adr + sensor_dim))
-        #     )
-        # self._foot_linvel_sensor_adr = jnp.array(foot_linvel_sensor_adr)
-
-        # qpos_noise_scale = np.zeros(12)
-        # hip_ids = [0, 1, 2, 6, 7, 8]
-        # kfe_ids = [3, 9]
-        # ffe_ids = [4, 10]
-        # faa_ids = [5, 11]
-        # qpos_noise_scale[hip_ids] = self._config.noise_config.scales.hip_pos
-        # qpos_noise_scale[kfe_ids] = self._config.noise_config.scales.kfe_pos
-        # qpos_noise_scale[ffe_ids] = self._config.noise_config.scales.ffe_pos
-        # qpos_noise_scale[faa_ids] = self._config.noise_config.scales.faa_pos
-        # self._qpos_noise_scale = jnp.array(qpos_noise_scale)
-
+        self._p_gain = self._config.p_gain
+        self._d_gain = self._config.d_gain
 
     # ----------------------------------------------------------------------
     # Required abstract methods/properties
@@ -159,7 +124,7 @@ class CassieEnv(mjx_env.MjxEnv):
         return self._mjx_model.nu
 
     @property
-    def mj_model(self) -> mujoco.MjModel:
+    def mj_model(self) -> mj.MjModel:
         return self._mj_model
 
     @property
@@ -172,20 +137,22 @@ class CassieEnv(mjx_env.MjxEnv):
 
     def reset(self, rng: jax.Array) -> mjx_env.State:
         """Resets Cassie to default pose + small random perturbations."""
-        qpos = self._init_q
-        qvel = jnp.zeros(self.mjx_model.nv)
+        # TODO: determine if setting the positions actually works or if it causes
+        #       the model to explode due to equality constraints
+        qpos = self._init_qpos
+        qvel = jnp.zeros(self._mjx_model.nv)
 
-        rng, key = jax.random.split(rng)
+        rng, qpos, qvel = self._add_perturbations(rng, qpos, qvel)
+        rng, p_gain, d_gain = self._randomize_pd_gain(rng)
 
-        # Example randomization: add small noise to root position/orientation
-        qpos = qpos.at[0].add(jax.random.uniform(key, (), minval=-0.01, maxval=0.01))
-
-        data = mjx_env.init(self.mjx_model, qpos=qpos, qvel=qvel)
+        data = mjx_env.init(self._mjx_model, qpos=qpos, qvel=qvel)
         obs = self._get_obs(data)
 
         info = {
             "rng": rng,
             "step": 0,
+            "p_gain": p_gain,
+            "d_gain": d_gain
         }
 
         return mjx_env.State(
@@ -198,34 +165,57 @@ class CassieEnv(mjx_env.MjxEnv):
         )
 
     def step(self, state: mjx_env.State, action: jax.Array) -> mjx_env.State:
-        """Takes one control step in Cassie."""
+        """
+        Takes one control step in Cassie.
+
+        Args:
+            state: Current environment state.
+            action: Action to take. Shape: [action_size], values in [-1, 1].
+                    Should be interpreted as normalized position targets for
+                    the 10 actuated joints.
+        """
         rng = state.info["rng"]
         rng, key = jax.random.split(rng)
 
-        # Clip actions to [-1, 1] (scale to actuator range later if needed)
-        action = jnp.clip(action, -1.0, 1.0)
+        # jax.debug.print("action: {}", action)
 
-        # Run physics for n_substeps
-        actual_action = self._action_norm2actual(action)
+        pos_targets = self._action_norm2actual(action)
+
+        # jax.debug.print("pos_targets: {}", pos_targets)
+
+        p_gain = state.info["p_gain"]
+        d_gain = state.info["d_gain"]
+
+        torques = self._pd_control(
+            state.data,
+            pos_targets,
+            p_gain,
+            d_gain,
+            self._torque_lowers,
+            self._torque_uppers
+        )
+        # jax.debug.print("torques: {}", torques)
 
         data = state.data
         data = mjx_env.step(
-            self._mjx_model, state.data, actual_action, self.n_substeps
+            self._mjx_model, state.data, torques, self.n_substeps
         )
 
-        # New observation
         obs = self._get_obs(data)
 
-        # Placeholder reward: keep pelvis upright
         rewards = self._get_reward(data, action)
+
+        # for k, v in rewards.items():
+        #     jax.debug.print("{}: {}", k, v)
+            
         rewards = {
             k: v * self._config.reward_config.scales[k] for k, v in rewards.items()
         }
-        # reward = jnp.clip(sum(rewards.values()) * self.dt, 0.0, 10000.0)
         reward = sum(rewards.values()) * self.dt
         reward = jnp.clip(reward, -1000, 1000)
 
-        # Termination
+        # jax.debug.print("scalar reward: {}", reward)
+
         new_step = state.info.get("step", 0) + 1
         
         done = self._get_termination(data, jnp.array(new_step))
@@ -250,17 +240,17 @@ class CassieEnv(mjx_env.MjxEnv):
         # qpos: joint + base positions
         # qvel: joint + base velocities
         # First 7 entries of qpos are free joint (base pos + quaternion)
-        motor_qpos = data.qpos[MOTOR_IDX]   # exclude root pos/orientation
-        motor_qvel = data.qvel[MOTOR_VEL_IDX]   # exclude root linear + angular vel
-        pelvis_qvel = data.qvel[:6]
+        motor_qpos = data.qpos[QPosIdx.MOTORS]
+        motor_qvel = data.qvel[QVelIdx.MOTORS]
+        pelvis_qvel = data.qvel[QVelIdx.BASE]
 
         # pelvis_lin_vel = data.qvel[:3]
 
         # Add pelvis orientation as a flat quaternion
-        pelvis_quat = data.qpos[3:7]   # 4D unit quaternion
+        pelvis_quat = data.qpos[QPosIdx.BASE_QUAT]
 
         # Pelvis height (z coord of root)
-        pelvis_height = data.qpos[2:3] # shape (1,)
+        pelvis_height = data.qpos[QPosIdx.BASE_HEIGHT] # shape (1,)
 
         # Concatenate into a single vector
         obs = jnp.concatenate([
@@ -277,7 +267,7 @@ class CassieEnv(mjx_env.MjxEnv):
         return {
             "alive": self._reward_alive(data),
             "pelvis_lin_vel": self._cost_pelvis_lin_vel(data),
-            "pelvis_orientation": self._cost_pelvis_orientation(data),
+            "pelvis_tilt": self._cost_pelvis_tilt(data),
             "motor_ref_error": self._cost_motor_reference_error(data),
         }
 
@@ -293,14 +283,14 @@ class CassieEnv(mjx_env.MjxEnv):
         cost = jnp.abs(v / v_scale)**2
         return jnp.clip(cost, 0, 1)
 
-    def _cost_pelvis_orientation(self, data: mjx.Data) -> jax.Array:
+    def _cost_pelvis_tilt(self, data: mjx.Data) -> jax.Array:
         """Cost for pelvis orientation (deviation from standing)."""
         # Get pelvis quaternion
         pelvis_quat = data.qpos[3:7]
         rpy = math_utils.quat2euler(pelvis_quat)
 
         # Only roll and pitch
-        orientation_err = math_utils.angle_diff(rpy[:2], STANDING_PELVIS_RPY[:2])
+        orientation_err = math_utils.angle_diff(rpy[:2], StandingPose.PELVIS_RPY[:2])
 
         # Mean squared error, normalized
         err_scale = 0.35  # radians
@@ -311,8 +301,8 @@ class CassieEnv(mjx_env.MjxEnv):
 
     def _cost_motor_reference_error(self, data: mjx.Data) -> jax.Array:
         """Cost for deviation of the motor angles from reference standing pose."""
-        motor_qpos = data.qpos[MOTOR_IDX]
-        err = motor_qpos - MOTORS_STANDING_POSE
+        motor_qpos = data.qpos[QPosIdx.MOTORS]
+        err = motor_qpos - StandingPose.MOTOR_ANGLES
         err_scale = 0.35  # Normalizing constant (radians)
         cost = jnp.mean((err / err_scale)**2)
         return jnp.clip(cost, 0, 1)
@@ -320,7 +310,7 @@ class CassieEnv(mjx_env.MjxEnv):
     def _get_termination(self, data: mjx.Data, step: jax.Array) -> jax.Array:
         """Return True if Cassie has fallen or max timesteps reached."""
         # Pelvis height (z-coordinate)
-        pelvis_z = data.qpos[2]
+        pelvis_z = data.qpos[QPosIdx.BASE_HEIGHT].squeeze()
         fallen = pelvis_z < FALLING_THRESHOLD
 
         max_steps = jnp.array(self._config.episode_length, dtype=step.dtype)
@@ -338,13 +328,95 @@ class CassieEnv(mjx_env.MjxEnv):
         done = jnp.logical_or(fallen, max_steps_reached)
         return done
     
+    def _add_perturbations(
+            self, rng: jax.Array, qpos: jax.Array, qvel: jax.Array
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """Add uniform random perturbations to base and motor positions/velocities."""
+        # x=+U(-0.5, 0.5), y=+U(-0.5, 0.5), z=+U(0, 0.2), yaw=U(-3.14, 3.14).
+        rng, key = jax.random.split(rng)
+        dxy = jax.random.uniform(key, (2,), minval=-0.5, maxval=0.5)
+
+        rng, key = jax.random.split(rng)
+        dz = jax.random.uniform(key, (1,), minval=0.0, maxval=0.2)
+
+        rng, key = jax.random.split(rng)
+        yaw = jax.random.uniform(key, (1,), minval=-3.14, maxval=3.14)
+        quat = math_utils.euler2quat(jnp.array([0.0, 0.0, yaw[0]]))
+
+        
+        qpos = qpos.at[QPosIdx.BASE_XY].add(dxy)
+        qpos = qpos.at[QPosIdx.BASE_HEIGHT].add(dz)
+        qpos = qpos.at[QPosIdx.BASE_QUAT].set(quat)
+
+        # qpos[MOTORS]=*U(0.8, 1.2)
+        rng, key = jax.random.split(rng)
+        qpos = qpos.at[QPosIdx.MOTORS].set(
+            qpos[QPosIdx.MOTORS] * jax.random.uniform(key, (10,), minval=0.8, maxval=1.2)
+        )
+
+        # d(xyzrpy)=U(-0.5, 0.5)
+        rng, key = jax.random.split(rng)
+        qvel = qvel.at[QVelIdx.BASE].add(
+            jax.random.uniform(key, (6,), minval=-0.5, maxval=0.5)
+        )
+
+        return rng, qpos, qvel
+    
+    def _randomize_pd_gain(self, rng: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """Returns PD gains with an uncertainty applied."""
+        rng, key = jax.random.split(rng)
+        p_gain = (self._config.p_gain *
+                  jax.random.uniform(
+                      key,
+                      shape=self._config.p_gain.shape,
+                      minval=1.0 - self._config.pd_uncertainty,
+                      maxval=1.0 + self._config.pd_uncertainty
+                  )
+        )
+        rng, key = jax.random.split(rng)
+        d_gain = (self._config.d_gain *
+                  jax.random.uniform(
+                      key,
+                      shape=self._config.d_gain.shape,
+                      minval=1.0 - self._config.pd_uncertainty,
+                      maxval=1.0 + self._config.pd_uncertainty
+                  )
+        )
+        return rng, p_gain, d_gain
+
     def _action_norm2actual(self, action: jax.Array) -> jax.Array:
-        """Scales normalized actions [-1, 1] to actual actuator control range."""
-        return self._actuator_soft_bounds[0] + (action + 1) / 2.0 * (
-            self._actuator_soft_bounds[1] - self._actuator_soft_bounds[0]
+        """Scales normalized actions [-1, 1] to actual motor joint ranges."""
+        return self._jnt_soft_lowers + (action + 1) / 2.0 * (
+            self._jnt_soft_uppers - self._jnt_soft_lowers
         )
     
-    def _set_motor_base_pos(model, data, motor_idx, base_idx, motor_pos, base_pos, iters=1500):
+    def _pd_control(
+            self,
+            data: mjx.Data,
+            pos_targets: jax.Array,
+            p_gain: jax.Array,
+            d_gain: jax.Array,
+            torque_lb: jax.Array,
+            torque_ub: jax.Array,
+    ) -> jax.Array:
+        """Computes PD control torques for the actuated joints."""
+        # TODO: add PD uncertainty
+        # Current motor positions and velocities
+        motor_qpos = data.qpos[QPosIdx.MOTORS]
+        motor_qvel = data.qvel[QVelIdx.MOTORS]
+
+        # PD control
+        pos_err = pos_targets - motor_qpos
+        vel_err = -motor_qvel  # Target vel is zero
+
+        jax.debug.print("pos_err: {}", pos_err)
+        jax.debug.print("vel_err: {}", vel_err)
+
+        torques = p_gain * pos_err + d_gain * vel_err
+
+        return jnp.clip(torques, torque_lb, torque_ub)
+    
+    def _set_motor_base_pos(self, model, data, motor_idx, base_idx, motor_pos, base_pos, iters=1500):
         def project_state(model, data, iters):
             # Abuses the MJX solver to get constrained forward kinematics.
             def body_fun(_, d):
@@ -358,4 +430,4 @@ class CassieEnv(mjx_env.MjxEnv):
         data = data.replace(qpos=qpos, qvel=qvel)
         data = project_state(model, data, iters=iters)
         return data
-    
+

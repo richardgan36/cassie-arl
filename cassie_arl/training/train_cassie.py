@@ -5,26 +5,17 @@ from typing import Any, Dict, Sequence, Tuple, Union
 from pathlib import Path
 
 # Third-party packages
-from brax import base
-from brax import envs
-from brax import math
 from brax.training.agents.ppo import networks as ppo_networks
 from brax.training.agents.ppo import train as ppo
-from flax import struct
-from flax.training import orbax_utils
 import jax
 from jax import numpy as jnp
 from matplotlib import pyplot as plt
 import matplotlib.animation as animation
-from ml_collections import config_dict
 import mujoco
 from mujoco import mjx
 import numpy as np
-from orbax import checkpoint as ocp
 
 from mujoco_playground import wrapper
-from mujoco_playground import registry
-from mujoco_playground.config import locomotion_params
 
 from cassie_arl.rl_env.my_cassie_env import CassieEnv, default_config
 from cassie_arl.rl_env.cassie_domain_randomizer import domain_randomize
@@ -76,7 +67,7 @@ def progress(num_steps, metrics):
     plt.title(f"y={y_data[-1]:.3f}")
     plt.pause(0.005)  # Small pause to update the figure
 
-    # save_path = script_dir / "progress" / "cassie_ppo" / "progress-9-10.png"
+    # save_path = script_dir / "progress" / "cassie_ppo" / "progress-9-11.png"
     # save_path.parent.mkdir(parents=True, exist_ok=True)
     # plt.savefig(str(save_path), dpi=150, bbox_inches="tight")
 
@@ -96,16 +87,19 @@ network_factory = functools.partial(
 
 # # --- Shorten training for testing ---
 ppo_training_params["num_evals"] = 2
-ppo_training_params["episode_length"] = 2
-ppo_training_params["num_envs"] = 64
+ppo_training_params["episode_length"] = 5
+ppo_training_params["num_envs"] = 1
 ppo_training_params["num_minibatches"] = 4
-ppo_training_params["num_timesteps"] = 10
+ppo_training_params["batch_size"] = 2
+ppo_training_params["num_timesteps"] = 1000
 
 print("[INFO] PPO training parameters:")
 print(ppo_training_params)
 
-save_ckpt_dir = script_dir / "checkpoints" / f"cassie_ppo"
-print(f"[INFO] Checkpoints will be saved to {save_ckpt_dir}")
+# save_ckpt_dir = script_dir / "checkpoints" / f"cassie_ppo"
+# save_ckpt_dir = script_dir / "checkpoints" / f"cassie_ppo2"
+
+# print(f"[INFO] Checkpoints will be saved to {save_ckpt_dir}")
 
 restore_ckpt_path = script_dir / "checkpoints" / "cassie_ppo" / "000074547200"
 
@@ -141,6 +135,9 @@ modify_scene_fns = []
 phase_dt = 2 * jnp.pi * eval_env.dt * 1.5
 phase = jnp.array([0, jnp.pi])
 
+
+# TODO: instead of just generating an animation at the very end of training,
+#       do it throughout to get better progress info
 print("[INFO] Generating rollout")
 for j in range(1):
     state = jit_reset(rng)

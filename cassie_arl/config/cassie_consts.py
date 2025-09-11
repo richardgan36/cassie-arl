@@ -1,9 +1,7 @@
+import jax
 from jax import numpy as jnp
+from dataclasses import dataclass
 
-### Indices
-BASE_IDX = jnp.array([0, 1, 2, 3, 4, 5, 6])
-MOTOR_IDX = jnp.array([7, 8, 9, 14, 20, 21, 22, 23, 28, 34])
-MOTOR_VEL_IDX = jnp.array([6, 7, 8, 12, 18, 19, 20, 21, 25, 31])
 
 LEFT_HIP_ROLL_IDX = 0
 LEFT_HIP_YAW_IDX = 1
@@ -35,3 +33,49 @@ MOTORS_STANDING_POSE = STANDING_POSE[6:]
 STANDING_PELVIS_RPY = STANDING_POSE[3:6]
 
 FALLING_THRESHOLD = 0.55
+
+
+@dataclass(frozen=True)
+class StandingPose:
+    PELVIS_RPY: jax.Array = jnp.array([0.0, 0.0, 0.0])
+    MOTOR_ANGLES: jax.Array = jnp.array([
+        0.0,        # Left hip roll
+        0.0,        # Left hip yaw
+        0.4544,     # Left hip pitch
+        -1.21,      # Left knee
+        -1.643,     # Left foot
+        0.0,        # Right hip roll
+        0.0,        # Right hip yaw
+        0.4544,     # Right hip pitch
+        -1.21,      # Right knee
+        -1.643,     # Right foot
+    ])
+
+
+@dataclass(frozen=True)
+class JntRangeIdx:
+    MOTORS: jax.Array = jnp.array([
+        1, 2, 3, 5, 11,
+        12, 13, 14, 16, 22
+    ])
+
+
+@dataclass(frozen=True)
+class QPosIdx:
+    BASE: jax.Array = jnp.array([0, 1, 2, 3, 4, 5, 6])
+    BASE_XY: jax.Array = jnp.array([0, 1])
+    BASE_HEIGHT: jax.Array = jnp.array([2])
+    BASE_QUAT: jax.Array = jnp.array([3, 4, 5, 6])
+    MOTORS: jax.Array = jnp.array([
+        7, 8, 9, 14, 20,
+        21, 22, 23, 28, 34
+    ])
+
+
+@dataclass(frozen=True)
+class QVelIdx:
+    BASE: jax.Array = jnp.array([0, 1, 2, 3, 4, 5])
+    MOTORS: jax.Array = jnp.array([
+        6, 7, 8, 12, 18,
+        19, 20, 21, 25, 31
+    ])
