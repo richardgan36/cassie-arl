@@ -60,9 +60,9 @@ def default_config() -> config_dict.ConfigDict:
         reward_config=config_dict.create(
             scales=config_dict.create(
                 alive=1.0,
-                pelvis_lin_vel=-0.7,
-                pelvis_tilt=-0.5,
-                motor_ref_error=-0.3
+                pelvis_lin_vel=-0.5,
+                pelvis_tilt=-0.3,
+                motor_ref_error=-0.2
             ),
         ),
     )
@@ -105,7 +105,7 @@ class CassieEnv(mjx_env.MjxEnv):
 
         self._torque_lowers, self._torque_uppers = self._mj_model.actuator_ctrlrange.T
 
-        self._pelvis_id = self._mj_model.body("cassie-pelvis").id
+        # self._pelvis_id = self._mj_model.body("cassie-pelvis").id
 
         self._p_gain = self._config.p_gain
         self._d_gain = self._config.d_gain
@@ -201,6 +201,8 @@ class CassieEnv(mjx_env.MjxEnv):
             self._mjx_model, state.data, torques, self.n_substeps
         )
 
+        # jax.debug.print("data.contact: {}", data.contact)
+
         obs = self._get_obs(data)
 
         rewards = self._get_reward(data, action)
@@ -244,17 +246,21 @@ class CassieEnv(mjx_env.MjxEnv):
         motor_qvel = data.qvel[QVelIdx.MOTORS]
         pelvis_qvel = data.qvel[QVelIdx.BASE]
 
-        # pelvis_lin_vel = data.qvel[:3]
-
         # Add pelvis orientation as a flat quaternion
         pelvis_quat = data.qpos[QPosIdx.BASE_QUAT]
+        gravity_in_pelvis_frame = math_utils.gravity_in_base_frame(pelvis_quat)
 
         # Pelvis height (z coord of root)
-        pelvis_height = data.qpos[QPosIdx.BASE_HEIGHT] # shape (1,)
+        pelvis_height = data.qpos[QPosIdx.BASE_HEIGHT]  # shape (1,)
 
         # Concatenate into a single vector
         obs = jnp.concatenate([
-            pelvis_quat, pelvis_height, motor_qpos, motor_qvel, pelvis_qvel
+            pelvis_height,
+            pelvis_quat,
+            gravity_in_pelvis_frame,
+            motor_qpos,
+            motor_qvel,
+            pelvis_qvel
         ])
 
         return obs
@@ -273,20 +279,20 @@ class CassieEnv(mjx_env.MjxEnv):
 
     def _reward_alive(self, data: mjx.Data) -> jax.Array:
         """Reward for staying 'alive' (not falling over)."""
-        return jnp.where(data.qpos[2] > 0.5, 1.0, 0.0)
+        return jnp.where(data.qpos[2] > FALLING_THRESHOLD, 1.0, 0.0)
 
     def _cost_pelvis_lin_vel(self, data: mjx.Data) -> jax.Array:
         """Cost for pelvis linear velocity."""
         pelvis_lin_vel = data.qvel[:3]
-        v = jnp.sqrt(jnp.sum(pelvis_lin_vel**2))
-        v_scale = 0.1  # Normalizing constant (m/s)
-        cost = jnp.abs(v / v_scale)**2
+        v_sq = jnp.sum(pelvis_lin_vel**2)
+        v_scale = 0.2**2  # Normalizing constant (m/s)^2
+        cost = v_sq / v_scale
         return jnp.clip(cost, 0, 1)
 
     def _cost_pelvis_tilt(self, data: mjx.Data) -> jax.Array:
         """Cost for pelvis orientation (deviation from standing)."""
         # Get pelvis quaternion
-        pelvis_quat = data.qpos[3:7]
+        pelvis_quat = data.qpos[QPosIdx.BASE_QUAT]
         rpy = math_utils.quat2euler(pelvis_quat)
 
         # Only roll and pitch
@@ -409,8 +415,8 @@ class CassieEnv(mjx_env.MjxEnv):
         pos_err = pos_targets - motor_qpos
         vel_err = -motor_qvel  # Target vel is zero
 
-        jax.debug.print("pos_err: {}", pos_err)
-        jax.debug.print("vel_err: {}", vel_err)
+        # jax.debug.print("pos_err: {}", pos_err)
+        # jax.debug.print("vel_err: {}", vel_err)
 
         torques = p_gain * pos_err + d_gain * vel_err
 

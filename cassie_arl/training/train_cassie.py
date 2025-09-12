@@ -46,7 +46,7 @@ ppo_training_params = {
     'num_evals': 20,
     'num_minibatches': 32,
     'num_resets_per_eval': 1,
-    'num_timesteps': 200_000_000,
+    'num_timesteps': 300_000_000,
     'num_updates_per_batch': 4,
     'reward_scaling': 1.0,
     'unroll_length': 20
@@ -65,9 +65,9 @@ def progress(num_steps, metrics):
     plt.xlabel("# environment steps")
     plt.ylabel("reward per episode")
     plt.title(f"y={y_data[-1]:.3f}")
-    plt.pause(0.005)  # Small pause to update the figure
+    # plt.pause(0.005)  # Small pause to update the figure
 
-    # save_path = script_dir / "progress" / "cassie_ppo" / "progress-9-11.png"
+    # save_path = script_dir / "progress" / "cassie_ppo" / "progress-9-13.png"
     # save_path.parent.mkdir(parents=True, exist_ok=True)
     # plt.savefig(str(save_path), dpi=150, bbox_inches="tight")
 
@@ -86,22 +86,21 @@ network_factory = functools.partial(
 )
 
 # # --- Shorten training for testing ---
-ppo_training_params["num_evals"] = 2
+ppo_training_params["num_evals"] = 1
 ppo_training_params["episode_length"] = 5
 ppo_training_params["num_envs"] = 1
 ppo_training_params["num_minibatches"] = 4
 ppo_training_params["batch_size"] = 2
-ppo_training_params["num_timesteps"] = 1000
+ppo_training_params["num_timesteps"] = 100
 
 print("[INFO] PPO training parameters:")
 print(ppo_training_params)
 
-# save_ckpt_dir = script_dir / "checkpoints" / f"cassie_ppo"
-# save_ckpt_dir = script_dir / "checkpoints" / f"cassie_ppo2"
+save_ckpt_dir = script_dir / "checkpoints" / f"cassie_ppo_obs34"  # Observation space is 34D
 
-# print(f"[INFO] Checkpoints will be saved to {save_ckpt_dir}")
+print(f"[INFO] Checkpoints will be saved to {save_ckpt_dir}")
 
-restore_ckpt_path = script_dir / "checkpoints" / "cassie_ppo" / "000074547200"
+# restore_ckpt_path = script_dir / "checkpoints" / "cassie_ppo" / "000074547200"
 
 train_fn = functools.partial(
     ppo.train, **dict(ppo_training_params),
@@ -109,7 +108,7 @@ train_fn = functools.partial(
     randomization_fn=randomizer,
     progress_fn=progress,
     # save_checkpoint_path=str(save_ckpt_dir),
-    restore_checkpoint_path=str(restore_ckpt_path)
+    # restore_checkpoint_path=str(restore_ckpt_path)
 )
 
 # Start training
@@ -132,17 +131,13 @@ rng = jax.random.PRNGKey(1)
 rollout = []
 modify_scene_fns = []
 
-phase_dt = 2 * jnp.pi * eval_env.dt * 1.5
-phase = jnp.array([0, jnp.pi])
-
 
 # TODO: instead of just generating an animation at the very end of training,
 #       do it throughout to get better progress info
 print("[INFO] Generating rollout")
 for j in range(1):
     state = jit_reset(rng)
-    state.info["phase_dt"] = phase_dt
-    state.info["phase"] = phase
+
     for i in range(env_cfg.episode_length):
         act_rng, rng = jax.random.split(rng)
         ctrl, _ = jit_inference_fn(state.obs, act_rng)
