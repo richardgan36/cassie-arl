@@ -34,7 +34,6 @@ def default_config() -> config_dict.ConfigDict:
 
         # PD gains for the 10 actuated joints
         # Values are from Z Li et al. 2024 but scaled down to avoid excessive saturation
-        # TODO: ckeck these: right now the torques are always saturated
         p_gain = jnp.array([
             8, 4, 4, 10, 0.4,
             8, 4, 4, 10, 0.4
@@ -75,7 +74,6 @@ def default_config() -> config_dict.ConfigDict:
 
 class CassieEnv(mjx_env.MjxEnv):
     """Cassie environment built on MJX, compatible with Brax PPO."""
-    # TODO: consider implementing render method (see if the base render method is enough)
     # TODO: replace manual rendering in train_cassie with render method for better debugging
     # TODO: add random pushes to improve robustness
     # TODO: add metrics
@@ -142,8 +140,6 @@ class CassieEnv(mjx_env.MjxEnv):
 
     def reset(self, rng: jax.Array) -> mjx_env.State:
         """Resets Cassie to default pose + small random perturbations."""
-        # TODO: determine if setting the positions actually works or if it causes
-        #       the model to explode due to equality constraints
         qpos = self._init_qpos
         qvel = jnp.zeros(self._mjx_model.nv)
 
@@ -255,8 +251,7 @@ class CassieEnv(mjx_env.MjxEnv):
     def _get_obs(self, data) -> jax.Array:
         """Constructs observation from mjx.Data (Cassie)."""
         # TODO: separate "state" and "privileged state"
-        # TODO: consider adding contact flags / foot heights / swing time / etc.
-        # TODO: consider adding gravity vector relative to pelvis frame
+        # TODO: add foot contact info
 
         # qpos: joint + base positions
         # qvel: joint + base velocities
@@ -437,7 +432,6 @@ class CassieEnv(mjx_env.MjxEnv):
             torque_ub: jax.Array,
     ) -> jax.Array:
         """Computes PD control torques for the actuated joints."""
-        # TODO: add PD uncertainty
         # Current motor positions and velocities
         motor_qpos = data.qpos[QPosIdx.MOTORS]
         motor_qvel = data.qvel[QVelIdx.MOTORS]
