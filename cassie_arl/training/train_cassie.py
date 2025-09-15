@@ -14,6 +14,7 @@ import matplotlib.animation as animation
 import mujoco
 from mujoco import mjx
 import numpy as np
+from absl import logging
 
 from mujoco_playground import wrapper
 
@@ -23,9 +24,10 @@ from cassie_arl.rl_env.cassie_domain_randomizer import domain_randomize
 
 script_dir = Path(__file__).parent.resolve()
 
-plt.ion()  # Interactive mode
+# plt.ion()  # Interactive mode
+logging.set_verbosity(logging.INFO)
 
-network_factory = {
+network_factory_params = {
     "policy_hidden_layer_sizes": (512, 256, 128),
     "policy_obs_key": "state",
     "value_hidden_layer_sizes": (512, 256, 128),
@@ -67,6 +69,9 @@ def progress(num_steps, metrics):
     plt.title(f"y={y_data[-1]:.3f}")
     # plt.pause(0.005)  # Small pause to update the figure
 
+    logging.info(f"steps: {num_steps}, reward: {y_data[-1]:.3f} ± {y_dataerr[-1]:.3f}")
+    logging.info(f"time since last progress call: {times[-1] - times[-2]}")
+
     # save_path = script_dir / "progress" / "cassie_ppo" / "progress-9-13.png"
     # save_path.parent.mkdir(parents=True, exist_ok=True)
     # plt.savefig(str(save_path), dpi=150, bbox_inches="tight")
@@ -82,7 +87,7 @@ randomizer = None
 
 network_factory = functools.partial(
     ppo_networks.make_ppo_networks,
-    **dict(network_factory)
+    **dict(network_factory_params)
 )
 
 # # --- Shorten training for testing ---
@@ -93,14 +98,13 @@ ppo_training_params["num_minibatches"] = 4
 ppo_training_params["batch_size"] = 2
 ppo_training_params["num_timesteps"] = 100
 
-print("[INFO] PPO training parameters:")
-print(ppo_training_params)
+logging.info("PPO training parameters:")
+logging.info(ppo_training_params)
 
-save_ckpt_dir = script_dir / "checkpoints" / f"cassie_ppo_obs34"  # Observation space is 34D
+train_id = "cassie_ppo_obs34"  # Observation space is 34D
 
-print(f"[INFO] Checkpoints will be saved to {save_ckpt_dir}")
-
-# restore_ckpt_path = script_dir / "checkpoints" / "cassie_ppo" / "000074547200"
+save_ckpt_dir = script_dir / "checkpoints" / train_id 
+restore_ckpt_path = script_dir / "checkpoints" / train_id / "000143032320"
 
 train_fn = functools.partial(
     ppo.train, **dict(ppo_training_params),
@@ -108,68 +112,29 @@ train_fn = functools.partial(
     randomization_fn=randomizer,
     progress_fn=progress,
     # save_checkpoint_path=str(save_ckpt_dir),
-    # restore_checkpoint_path=str(restore_ckpt_path)
+    restore_checkpoint_path=str(restore_ckpt_path)
 )
 
+if "save_checkpoint_path" in train_fn.keywords:
+    logging.info(f"Checkpoints will be saved to {train_fn.keywords['save_checkpoint_path']}")
+
 # Start training
-print("[INFO] Starting training")
 make_inference_fn, params, metrics = train_fn(
     environment=env,
     eval_env=CassieEnv(),
     wrap_env_fn=wrapper.wrap_for_brax_training,
 )
-print(f"time to jit: {times[1] - times[0]}")
-print(f"time to train: {times[-1] - times[1]}")
+logging.info(f"time to jit: {times[1] - times[0]}")
+logging.info(f"time to train: {times[-1] - times[1]}")
 
 eval_env = CassieEnv()
 jit_reset = jax.jit(eval_env.reset)
 jit_step = jax.jit(eval_env.step)
 jit_inference_fn = jax.jit(make_inference_fn(params, deterministic=True))
 
-rng = jax.random.PRNGKey(1)
-
-rollout = []
-modify_scene_fns = []
-
-
-# TODO: instead of just generating an animation at the very end of training,
-#       do it throughout to get better progress info
-print("[INFO] Generating rollout")
-for j in range(1):
-    state = jit_reset(rng)
-
-    for i in range(env_cfg.episode_length):
-        act_rng, rng = jax.random.split(rng)
-        ctrl, _ = jit_inference_fn(state.obs, act_rng)
-        state = jit_step(state, ctrl)
-        if state.done:
-            break
-        rollout.append(state)
-
-        # Don't need below block for visualizing the command as we have no commands
-
-        # xyz = np.array(state.data.xpos[eval_env.mj_model.body("cassie-pelvis").id])
-        # xyz += np.array([0, 0.0, 0])
-        # x_axis = state.data.xmat[eval_env.mj_model.body("cassie-pelvis").id, 0]
-        # yaw = -np.arctan2(x_axis[1], x_axis[0])
-        # modify_scene_fns.append(
-        #     functools.partial(
-        #         draw_joystick_command,
-        #         cmd=state.info["command"],
-        #         xyz=xyz,
-        #         theta=yaw,
-        #         scl=np.linalg.norm(state.info["command"]),
-        #     )
-        # )
-
-
+# ---- Generate rollout and render to video ----
 render_every = 1
-fps = 1.0 / eval_env.dt / render_every
-print(f"fps: {fps}")
-traj = rollout[::render_every]
-# mod_fns = modify_scene_fns[::render_every]
-
-print("[INFO] Rendering video at {} fps".format(fps))
+rollout = []
 
 scene_option = mujoco.MjvOption()
 scene_option.geomgroup[2] = True
@@ -178,40 +143,68 @@ scene_option.flags[mujoco.mjtVisFlag.mjVIS_CONTACTPOINT] = True
 scene_option.flags[mujoco.mjtVisFlag.mjVIS_TRANSPARENT] = False
 scene_option.flags[mujoco.mjtVisFlag.mjVIS_PERTFORCE] = False
 
-frames = eval_env.render(
-    traj,
-    camera="track",
-    scene_option=scene_option,
-    width=640*2,
-    height=480,
-    # modify_scene_fns=mod_fns
-)
+# TODO: instead of just generating an animation at the very end of training,
+#       do it throughout to get better progress info
+logging.info("Generating rollout")
+n_rollouts = 1   # number of random conditions to visualize
+all_frames = []
 
-# ---- Matplotlib animation setup ----
-fig, ax = plt.subplots()
-ax.axis('off')  # hide axes
+for j in range(n_rollouts):
+    logging.info(f"Rollout {j}")
+    rng = jax.random.PRNGKey(j)
+    state = jit_reset(rng)
 
-# Display the first frame
-im = ax.imshow(frames[0])
+    rollout = []
+    for i in range(env_cfg.episode_length):
+        act_rng, rng = jax.random.split(rng)
+        ctrl, _ = jit_inference_fn(state.obs, act_rng)
+        state = jit_step(state, ctrl)
 
-# Update function for animation
-def update(frame):
-    im.set_data(frame)
-    return [im]
+        # --- Debugging: print action and reward components ---
+        reward_components = state.info.get("reward_components", None)
+        action = state.info.get("action", None)
+        if reward_components is not None and action is not None:
+            logging.info(f"Step {i}: action={np.asarray(action)}, rewards={ {k: float(np.asarray(v)) for k,v in reward_components.items()} }")
+        # -----------------------------------------------------
 
-# Create the animation
-ani = animation.FuncAnimation(
-    fig,
-    update,
-    frames=frames,
-    interval=1000/fps,  # milliseconds per frame
-    blit=True
-)
+        if bool(state.done):
+            break
+        rollout.append(state)
 
-# ---- Save as MP4 ----
-timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-ani_save_path = script_dir / "simulation" / f"simulation-{timestamp}.mp4"
-ani_save_path.parent.mkdir(parents=True, exist_ok=True)
-ani.save(ani_save_path, writer='ffmpeg', fps=fps)
-print(f"[INFO] Saved video to {ani_save_path}")
+    traj = rollout[::render_every]
 
+    frames = eval_env.render(
+        traj,
+        camera="track",
+        scene_option=scene_option,
+        width=640*2,
+        height=480,
+    )
+    all_frames.append(frames)
+
+# ---- Save each rollout separately ----
+ani_save_dir = script_dir / "simulation" / train_id
+ani_save_dir.mkdir(parents=True, exist_ok=True)
+fps = 1.0 / eval_env.dt / render_every
+for j, frames in enumerate(all_frames):
+    fig, ax = plt.subplots()
+    ax.axis("off")
+    im = ax.imshow(frames[0])
+
+    def update(frame):
+        im.set_data(frame)
+        return [im]
+
+    ani = animation.FuncAnimation(
+        fig,
+        update,
+        frames=frames,
+        interval=1000/fps,
+        blit=True
+    )
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ani_save_path = ani_save_dir / f"rollout{j}-{timestamp}.mp4"
+    ani.save(ani_save_path, writer="ffmpeg", fps=fps)
+    logging.info(f"Saved rollout {j} to {ani_save_path}")
+    plt.close(fig)

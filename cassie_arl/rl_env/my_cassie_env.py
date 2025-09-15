@@ -24,7 +24,7 @@ def default_config() -> config_dict.ConfigDict:
         # --------------------------------
         ctrl_dt=0.02,
         sim_dt=0.002,
-        episode_length=1000,  # 20 seconds at ctrl_dt=0.02
+        episode_length=500,  # 10 seconds at ctrl_dt=0.02
         action_repeat=1,
         history_len=1,
 
@@ -57,11 +57,16 @@ def default_config() -> config_dict.ConfigDict:
                 gyro=0.2,  # angvel.
             ),
         ),
+
+        # Reward function configuration
+        # Except for the "fall" cost, which is a one-time cost, all reward weights
+        # are in [0, 1] and all cost weights are in [-1, 0].
         reward_config=config_dict.create(
             scales=config_dict.create(
                 alive=1.0,
-                pelvis_lin_vel=-0.5,
-                pelvis_tilt=-0.3,
+                fall=-5.0,
+                pelvis_lin_vel=-0.2,
+                pelvis_tilt=-0.1,
                 motor_ref_error=-0.2
             ),
         ),
@@ -152,7 +157,15 @@ class CassieEnv(mjx_env.MjxEnv):
             "rng": rng,
             "step": 0,
             "p_gain": p_gain,
-            "d_gain": d_gain
+            "d_gain": d_gain,
+            "reward_components": {
+                "alive": jnp.zeros(()),
+                "fall": jnp.zeros(()),
+                "pelvis_lin_vel": jnp.zeros(()),
+                "pelvis_tilt": jnp.zeros(()),
+                "motor_ref_error": jnp.zeros(()),
+            },
+            "action": jnp.zeros((self.action_size,)), 
         }
 
         return mjx_env.State(
@@ -223,8 +236,14 @@ class CassieEnv(mjx_env.MjxEnv):
         done = self._get_termination(data, jnp.array(new_step))
         done = jnp.array(done, dtype=reward.dtype)
 
-        new_info = {**state.info, "step": new_step, "rng": rng}
-
+        # new_info = {**state.info, "step": new_step, "rng": rng}
+        new_info = {
+            **state.info,
+            "step": new_step,
+            "rng": rng,
+            "reward_components": rewards,  # For debugging
+            "action": action               # For debugging
+        }
         return state.replace(
             data=data,
             obs=obs,
@@ -266,12 +285,20 @@ class CassieEnv(mjx_env.MjxEnv):
         return obs
 
     def _get_reward(self, data: mjx.Data, action: jax.Array) -> dict[str, jax.Array]:
+        """
+        Computes reward components.
+
+        All rewards/costs are in [0, 1]. Their weights in self._config.reward_config.scales
+        determine their relative importance and sign.
+        """
+        # TODO: IMPORTANT: need to reward active recovery strategies, not just standing still
+        # TODO: look into selective/adaptive rewards e.g. lift costs for movement when perturbing robot
         # TODO: reward for COM above support polygon
         # TODO: cost for large change in acceleration
         # TODO: cost for large torques
-        # TODO: cost for deviation from standing pose
         return {
             "alive": self._reward_alive(data),
+            "fall": self._cost_fall(data),
             "pelvis_lin_vel": self._cost_pelvis_lin_vel(data),
             "pelvis_tilt": self._cost_pelvis_tilt(data),
             "motor_ref_error": self._cost_motor_reference_error(data),
@@ -279,13 +306,18 @@ class CassieEnv(mjx_env.MjxEnv):
 
     def _reward_alive(self, data: mjx.Data) -> jax.Array:
         """Reward for staying 'alive' (not falling over)."""
-        return jnp.where(data.qpos[2] > FALLING_THRESHOLD, 1.0, 0.0)
+        return jnp.array(1.0)
+    
+    def _cost_fall(self, data: mjx.Data) -> jax.Array:
+        """One time cost for falling over."""
+        fallen = self._has_fallen(data)
+        return jnp.where(fallen, 1.0, 0.0)
 
     def _cost_pelvis_lin_vel(self, data: mjx.Data) -> jax.Array:
         """Cost for pelvis linear velocity."""
-        pelvis_lin_vel = data.qvel[:3]
-        v_sq = jnp.sum(pelvis_lin_vel**2)
-        v_scale = 0.2**2  # Normalizing constant (m/s)^2
+        pelvis_lin_vel = data.qvel[QVelIdx.BASE_LIN_VEL]
+        v_sq = jnp.mean(pelvis_lin_vel**2)
+        v_scale = 0.8**2  # Normalizing constant (m/s)^2
         cost = v_sq / v_scale
         return jnp.clip(cost, 0, 1)
 
@@ -299,7 +331,7 @@ class CassieEnv(mjx_env.MjxEnv):
         orientation_err = math_utils.angle_diff(rpy[:2], StandingPose.PELVIS_RPY[:2])
 
         # Mean squared error, normalized
-        err_scale = 0.35  # radians
+        err_scale = 0.26  # radians (~15 degrees)
         orientation_cost = jnp.mean((orientation_err / err_scale) ** 2)
 
         # Clip to [0,1]
@@ -316,8 +348,7 @@ class CassieEnv(mjx_env.MjxEnv):
     def _get_termination(self, data: mjx.Data, step: jax.Array) -> jax.Array:
         """Return True if Cassie has fallen or max timesteps reached."""
         # Pelvis height (z-coordinate)
-        pelvis_z = data.qpos[QPosIdx.BASE_HEIGHT].squeeze()
-        fallen = pelvis_z < FALLING_THRESHOLD
+        fallen = self._has_fallen(data)
 
         max_steps = jnp.array(self._config.episode_length, dtype=step.dtype)
         max_steps_reached = step >= max_steps
@@ -422,18 +453,7 @@ class CassieEnv(mjx_env.MjxEnv):
 
         return jnp.clip(torques, torque_lb, torque_ub)
     
-    def _set_motor_base_pos(self, model, data, motor_idx, base_idx, motor_pos, base_pos, iters=1500):
-        def project_state(model, data, iters):
-            # Abuses the MJX solver to get constrained forward kinematics.
-            def body_fun(_, d):
-                return mjx.step(model, d, ctrl=jnp.zeros(model.nu))
-            return jax.lax.fori_loop(0, iters, body_fun, data)
-
-        qpos = data.qpos.at[motor_idx].set(motor_pos)
-        qpos = qpos.at[base_idx].set(base_pos)
-        qvel = jnp.zeros_like(data.qvel)
-
-        data = data.replace(qpos=qpos, qvel=qvel)
-        data = project_state(model, data, iters=iters)
-        return data
-
+    def _has_fallen(self, data: mjx.Data) -> jax.Array:
+        """Returns True if Cassie has fallen (pelvis height below threshold)."""
+        pelvis_z = data.qpos[QPosIdx.BASE_HEIGHT].squeeze()
+        return pelvis_z < FALLING_THRESHOLD
