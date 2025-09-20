@@ -252,6 +252,9 @@ class CassieEnv(mjx_env.MjxEnv):
         """Constructs observation from mjx.Data (Cassie)."""
         # TODO: separate "state" and "privileged state"
         # TODO: add foot contact info
+        # TODO: consider using the difference between joint angles and standing pose
+        #       as observation instead of absolute angles. Then, the output of the policy
+        #       should also be relative to the standing pose.
 
         # qpos: joint + base positions
         # qvel: joint + base velocities
@@ -291,6 +294,8 @@ class CassieEnv(mjx_env.MjxEnv):
         # TODO: reward for COM above support polygon
         # TODO: cost for large change in acceleration
         # TODO: cost for large torques
+        # TODO: both feet in air penalty?
+
         return {
             "alive": self._reward_alive(data),
             "fall": self._cost_fall(data),
@@ -306,7 +311,10 @@ class CassieEnv(mjx_env.MjxEnv):
     def _cost_fall(self, data: mjx.Data) -> jax.Array:
         """One time cost for falling over."""
         fallen = self._has_fallen(data)
-        return jnp.where(fallen, 1.0, 0.0)
+        # If fallen, return 1.0 / self.dt. Divide by self.dt because all reward
+        # components are multipled by self.dt in the step function.
+        # _cost_fall is a one-time cost so should not be normalized by self.dt.
+        return jnp.where(fallen, 1.0 / self.dt, 0.0)
 
     def _cost_pelvis_lin_vel(self, data: mjx.Data) -> jax.Array:
         """Cost for pelvis linear velocity."""
@@ -340,7 +348,7 @@ class CassieEnv(mjx_env.MjxEnv):
         cost = jnp.mean((err / err_scale)**2)
         return jnp.clip(cost, 0, 1)
     
-    
+
 
     def _get_termination(self, data: mjx.Data, step: jax.Array) -> jax.Array:
         """Return True if Cassie has fallen or max timesteps reached."""
