@@ -339,6 +339,8 @@ class CassieEnv(mjx_env.MjxEnv):
         err_scale = 0.35  # Normalizing constant (radians)
         cost = jnp.mean((err / err_scale)**2)
         return jnp.clip(cost, 0, 1)
+    
+    
 
     def _get_termination(self, data: mjx.Data, step: jax.Array) -> jax.Array:
         """Return True if Cassie has fallen or max timesteps reached."""

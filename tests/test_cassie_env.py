@@ -12,7 +12,7 @@ repo_root = Path(__file__).resolve().parent.parent
 print(repo_root)
 sys.path.insert(0, str(repo_root))
 
-from cassie_arl.rl_env.my_cassie_env import CassieEnv
+from cassie_arl.rl_env.cassie_env import CassieEnv
 
 
 @pytest.fixture

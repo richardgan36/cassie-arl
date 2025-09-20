@@ -16,7 +16,7 @@ from mujoco import mjx
 from absl import logging
 from mujoco_playground import wrapper
 
-from cassie_arl.rl_env.my_cassie_env import CassieEnv, default_config
+from cassie_arl.rl_env.cassie_env import CassieEnv, default_config
 from cassie_arl.rl_env.cassie_domain_randomizer import domain_randomize
 
 
