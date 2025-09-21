@@ -15,6 +15,7 @@ import mujoco as mj
 from mujoco import mjx
 from absl import logging
 from mujoco_playground import wrapper
+import cv2
 
 from cassie_arl.rl_env.cassie_env import CassieEnv, default_config
 from cassie_arl.rl_env.cassie_domain_randomizer import domain_randomize
@@ -37,7 +38,7 @@ ppo_training_params = {
     'action_repeat': 1,
     'batch_size': 256,
     'clipping_epsilon': 0.2,
-    'discounting': 0.97,
+    'discounting': 0.97,  # TODO: Consider increasing
     'entropy_cost': 0.005,
     'episode_length': 512,
     'learning_rate': 0.0003,
@@ -135,23 +136,96 @@ def progress(num_steps: int, metrics: types.Metrics | dict):
         logging.info(f"Time since last progress call (steps {last_step} -> {num_steps}): {delta}")
 
 
-def visualize_policy(
-        current_step: int,
-        make_policy: types.Policy,
-        params: types.Params
-    ):
+# def visualize_policy(
+#         current_step: int,
+#         make_policy: types.Policy,
+#         params: types.Params
+#     ):
+#     try:
+#         logging.info(f"Generating rollout video at step {current_step}")
+
+#         # Build deterministic inference function from the provided factory.
+#         inference_fn = make_policy(params, deterministic=True)
+
+#         # Seed with current_step so videos vary across checkpoints.
+#         rng = jax.random.PRNGKey(int(current_step) & 0xFFFFFFFF)
+#         state = jit_reset(rng)
+
+#         # Rollout using current policy
+#         traj = []
+#         logging.info("Starting rollout")
+#         for i in range(env_cfg.episode_length):
+#             act_rng, rng = jax.random.split(rng)
+#             ctrl, _ = inference_fn(state.obs, act_rng)
+#             state = jit_step(state, ctrl)
+#             if bool(state.done):
+#                 break
+#             traj.append(state)
+
+#         logging.info(f"Rollout finished after {len(traj)} steps")
+
+#         if len(traj) == 0:
+#             logging.warning("No frames collected for rollout; skipping video save.")
+#             return
+
+#         # Rendering options
+#         scene_option = mj.MjvOption()
+#         scene_option.geomgroup[2] = True
+#         scene_option.geomgroup[3] = False
+#         scene_option.flags[mj.mjtVisFlag.mjVIS_CONTACTPOINT] = True
+#         scene_option.flags[mj.mjtVisFlag.mjVIS_TRANSPARENT] = False
+#         scene_option.flags[mj.mjtVisFlag.mjVIS_PERTFORCE] = False
+
+#         logging.info("Rendering rollout")
+#         frames = env.render(
+#             traj,
+#             camera="track",
+#             scene_option=scene_option,
+#             width=640 * 2,
+#             height=480,
+#         )
+
+#         # Save animation
+#         ani_save_dir = script_dir / "simulation" / train_id
+#         ani_save_dir.mkdir(parents=True, exist_ok=True)
+#         fps = float(1.0 / getattr(env, "dt", 0.02))
+
+#         fig, ax = plt.subplots()
+#         ax.axis("off")
+#         im = ax.imshow(np.asarray(frames[0]))
+
+#         def update(frame):
+#             im.set_data(np.asarray(frame))
+#             return [im]
+
+#         logging.info("Saving rollout video")
+
+#         ani = animation.FuncAnimation(
+#             fig,
+#             update,
+#             frames=frames,
+#             interval=1000 / fps,
+#             blit=True,
+#         )
+
+#         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+#         ani_save_path = ani_save_dir / f"rollout_step{current_step}-{timestamp}.mp4"
+#         ani.save(ani_save_path, writer="ffmpeg", fps=fps)
+#         plt.close(fig)
+#         logging.info(f"Saved rollout video to {ani_save_path}")
+#     except Exception as e:
+#         logging.exception(f"Failed to generate/save rollout video at step {current_step}: {e}")
+
+
+def visualize_policy(current_step: int, make_policy, params):
     try:
         logging.info(f"Generating rollout video at step {current_step}")
-
-        # Build deterministic inference function from the provided factory.
         inference_fn = make_policy(params, deterministic=True)
-
-        # Seed with current_step so videos vary across checkpoints.
         rng = jax.random.PRNGKey(int(current_step) & 0xFFFFFFFF)
         state = jit_reset(rng)
 
-        # Rollout using current policy
         traj = []
+        com_info_list = []  # store COM, distance, contacts, reward
         logging.info("Starting rollout")
         for i in range(env_cfg.episode_length):
             act_rng, rng = jax.random.split(rng)
@@ -161,60 +235,89 @@ def visualize_policy(
                 break
             traj.append(state)
 
-        logging.info(f"Rollout finished after {len(traj)} steps")
+            # ---- COM info ----
+            com = np.array(state.data.subtree_com[0])  # full 3D
+            vec_to_support = env._vector_com_to_support(state.data)
+            dist_to_support = np.linalg.norm(np.array(vec_to_support))
+            left_contact = bool(env._is_in_contact_with_ground(state.data, env._left_foot_gid))
+            right_contact = bool(env._is_in_contact_with_ground(state.data, env._right_foot_gid))
+            com_cost = float(state.info["reward_components"]["com_outside_support"])
+            com_info_list.append({
+                "com": com,
+                "dist": dist_to_support,
+                "left_contact": left_contact,
+                "right_contact": right_contact,
+                "cost": com_cost,
+                # "geom1": np.array(state.data._impl.contact.geom[:, 0]),
+                # "geom2": np.array(state.data._impl.contact.geom[:, 1]),
+            })
+
+            # # Filter the contacts by distance within a tolerance
+            # tol = 0.001  # 1 mm tolerance
+            # dists = state.data._impl.contact.dist
+            # valid_contact_indices = np.where(dists <= tol)[0]
+            # valid_dists = dists[valid_contact_indices]
+            # valid_geom1 = state.data._impl.contact.geom[valid_contact_indices, 0]
+            # valid_geom2 = state.data._impl.contact.geom[valid_contact_indices, 1]
+
+            # logging.info(f"Geom1: {valid_geom1}\n Geom2: {valid_geom2}\n Distances: {valid_dists}\n\n")
 
         if len(traj) == 0:
-            logging.warning("No frames collected for rollout; skipping video save.")
+            logging.warning("No frames collected; skipping.")
             return
 
-        # Rendering options
+        # Render frames
         scene_option = mj.MjvOption()
         scene_option.geomgroup[2] = True
         scene_option.geomgroup[3] = False
         scene_option.flags[mj.mjtVisFlag.mjVIS_CONTACTPOINT] = True
         scene_option.flags[mj.mjtVisFlag.mjVIS_TRANSPARENT] = False
         scene_option.flags[mj.mjtVisFlag.mjVIS_PERTFORCE] = False
+        frames = env.render(traj, camera="track", scene_option=scene_option, width=640*2, height=480)
 
-        logging.info("Rendering rollout")
-        frames = env.render(
-            traj,
-            camera="track",
-            scene_option=scene_option,
-            width=640 * 2,
-            height=480,
-        )
+        # Overlay COM sphere and text
+        frames_overlay = []
+        for f_idx, frame in enumerate(frames):
+            frame_rgb = np.array(frame).copy()
+            info = com_info_list[f_idx]
 
-        # Save animation
-        ani_save_dir = script_dir / "simulation" / train_id
-        ani_save_dir.mkdir(parents=True, exist_ok=True)
+            com = info['com']
+
+            # Add text
+            text_lines = [
+                f"COM: ({com[0]:.3f}, {com[1]:.3f}, {com[2]:.3f})",
+                f"COM->Support dist: {info['dist']:.3f} m",
+                f"L_contact: {info['left_contact']}, R_contact: {info['right_contact']}",
+                f"COM cost: {info['cost']:.3f}",
+            ]
+            for idx, line in enumerate(text_lines):
+                cv2.putText(frame_rgb, line, (10, 30 + idx*25),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+            frames_overlay.append(frame_rgb)
+
+        # Save video
         fps = float(1.0 / getattr(env, "dt", 0.02))
+        ani_save_dir = script_dir / "simulation" / train_id / "test"
+        ani_save_dir.mkdir(parents=True, exist_ok=True)
 
         fig, ax = plt.subplots()
         ax.axis("off")
-        im = ax.imshow(np.asarray(frames[0]))
+        im = ax.imshow(frames_overlay[0])
 
         def update(frame):
-            im.set_data(np.asarray(frame))
+            im.set_data(frame)
             return [im]
 
-        logging.info("Saving rollout video")
-
-        ani = animation.FuncAnimation(
-            fig,
-            update,
-            frames=frames,
-            interval=1000 / fps,
-            blit=True,
-        )
-
+        ani = animation.FuncAnimation(fig, update, frames=frames_overlay, interval=1000/fps, blit=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         ani_save_path = ani_save_dir / f"rollout_step{current_step}-{timestamp}.mp4"
         ani.save(ani_save_path, writer="ffmpeg", fps=fps)
         plt.close(fig)
         logging.info(f"Saved rollout video to {ani_save_path}")
+
     except Exception as e:
         logging.exception(f"Failed to generate/save rollout video at step {current_step}: {e}")
-
 
 env = CassieEnv()
 env_cfg = default_config()
@@ -233,12 +336,12 @@ network_factory = functools.partial(
 )
 
 # # --- Shorten training for testing ---
-ppo_training_params["num_evals"] = 2
+ppo_training_params["num_evals"] = 5
 ppo_training_params["episode_length"] = 5
 ppo_training_params["num_envs"] = 1
 ppo_training_params["num_minibatches"] = 4
 ppo_training_params["batch_size"] = 2
-ppo_training_params["num_timesteps"] = 100
+ppo_training_params["num_timesteps"] = 99
 
 logging.info("PPO training parameters:")
 logging.info(ppo_training_params)
@@ -251,7 +354,7 @@ train_fn = functools.partial(
     network_factory=network_factory,
     randomization_fn=randomizer,
     progress_fn=progress,
-    # policy_params_fn=visualize_policy,
+    policy_params_fn=visualize_policy,
     # save_checkpoint_path=str(save_ckpt_dir),
     restore_checkpoint_path=str(restore_ckpt_path)
 )

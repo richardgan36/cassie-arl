@@ -63,8 +63,8 @@ def default_config() -> config_dict.ConfigDict:
         reward_config=config_dict.create(
             scales=config_dict.create(
                 alive=1.0,
-                com_outside_support=-0.5,
                 fall=-5.0,
+                com_outside_support=-0.4,
                 pelvis_lin_vel=-0.2,
                 pelvis_tilt=-0.1,
                 motor_ref_error=-0.2
@@ -101,28 +101,30 @@ class CassieEnv(mjx_env.MjxEnv):
         self._default_pose = jnp.array(self._mj_model.keyframe("home").qpos[7:])
 
         # Apply soft limits on actuated joints for safe hardware deployment
-        self._jnt_lowers, self._jnt_uppers = self._mj_model.jnt_range[JntRangeIdx.MOTORS].T
+        self._jnt_lowers = jnp.array(self._mj_model.jnt_range[JntRangeIdx.MOTORS, 0])
+        self._jnt_uppers = jnp.array(self._mj_model.jnt_range[JntRangeIdx.MOTORS, 1])
         jnt_c = (self._jnt_lowers + self._jnt_uppers) / 2
         jnt_r = self._jnt_uppers - self._jnt_lowers
         self._jnt_soft_lowers = jnt_c - 0.5 * jnt_r * self._config.soft_joint_pos_limit_factors
         self._jnt_soft_uppers = jnt_c + 0.5 * jnt_r * self._config.soft_joint_pos_limit_factors
 
-        self._torque_lowers, self._torque_uppers = self._mj_model.actuator_ctrlrange.T
+        self._torque_lowers = jnp.array(self._mj_model.actuator_ctrlrange[:, 0])
+        self._torque_uppers = jnp.array(self._mj_model.actuator_ctrlrange[:, 1])
 
-        # MJCF geom and body IDs
         def geoms_of_body(model, body_id):
             start = model.body_geomadr[body_id]
             count = model.body_geomnum[body_id]
             geom_ids = jnp.arange(start, start + count)
             return geom_ids
         
-        self._floor_gid = self._mj_model.geom('floor').id
+        # MJCF geom and body IDs
+        self._floor_gid = self._mj_model.geom("floor").id
         self._pelvis_id = self._mj_model.body("cassie-pelvis").id
         self._left_foot_id = self._mj_model.body("left-foot").id
         self._right_foot_id = self._mj_model.body("right-foot").id
 
-        self._left_foot_gid = geoms_of_body(self._left_foot_id)
-        self._right_foot_gid = geoms_of_body(self._right_foot_id)
+        self._left_foot_gid = geoms_of_body(self._mj_model, self._left_foot_id)
+        self._right_foot_gid = geoms_of_body(self._mj_model, self._right_foot_id)
 
         self._p_gain = self._config.p_gain
         self._d_gain = self._config.d_gain
@@ -174,6 +176,7 @@ class CassieEnv(mjx_env.MjxEnv):
                 "pelvis_lin_vel": jnp.zeros(()),
                 "pelvis_tilt": jnp.zeros(()),
                 "motor_ref_error": jnp.zeros(()),
+                "com_outside_support": jnp.zeros(()),
             },
             "action": jnp.zeros((self.action_size,)), 
         }
@@ -314,12 +317,24 @@ class CassieEnv(mjx_env.MjxEnv):
 
         return {
             "alive": self._reward_alive(data),
-            "com_outside_support": self._cost_com_outside_support(data),
             "fall": self._cost_fall(data),
+            "com_outside_support": self._cost_com_outside_support(data),
             "pelvis_lin_vel": self._cost_pelvis_lin_vel(data),
             "pelvis_tilt": self._cost_pelvis_tilt(data),
             "motor_ref_error": self._cost_motor_reference_error(data),
         }
+
+    def _reward_alive(self, data: mjx.Data) -> jax.Array:
+        """Reward for staying 'alive' (not falling over)."""
+        return jnp.array(1.0)
+    
+    def _cost_fall(self, data: mjx.Data) -> jax.Array:
+        """One time cost for falling over."""
+        fallen = self._has_fallen(data)
+        # If fallen, return 1.0 / self.dt. Divide by self.dt because all reward
+        # components are multipled by self.dt in the step function.
+        # _cost_fall is a one-time cost so should not be normalized by self.dt.
+        return jnp.where(fallen, 1.0 / self.dt, 0.0)
 
     def _cost_com_outside_support(self, data: mjx.Data) -> jax.Array:
         """
@@ -337,19 +352,7 @@ class CassieEnv(mjx_env.MjxEnv):
         sigma = 0.07
         cost = 1 - jnp.exp(- (dist**2) / (2 * sigma**2))
         return jnp.clip(cost, 0.0, 1.0)
-
-    def _reward_alive(self, data: mjx.Data) -> jax.Array:
-        """Reward for staying 'alive' (not falling over)."""
-        return jnp.array(1.0)
     
-    def _cost_fall(self, data: mjx.Data) -> jax.Array:
-        """One time cost for falling over."""
-        fallen = self._has_fallen(data)
-        # If fallen, return 1.0 / self.dt. Divide by self.dt because all reward
-        # components are multipled by self.dt in the step function.
-        # _cost_fall is a one-time cost so should not be normalized by self.dt.
-        return jnp.where(fallen, 1.0 / self.dt, 0.0)
-
     def _cost_pelvis_lin_vel(self, data: mjx.Data) -> jax.Array:
         """Cost for pelvis linear velocity."""
         pelvis_lin_vel = data.qvel[QVelIdx.BASE_LIN_VEL]
@@ -484,22 +487,27 @@ class CassieEnv(mjx_env.MjxEnv):
         pelvis_z = data.qpos[QPosIdx.BASE_HEIGHT].squeeze()
         return pelvis_z < FALLING_THRESHOLD
 
-
     # ---------------- Support polygon & COM helpers ----------------
-    def _is_foot_in_contact_with_ground(self, data: mjx.Data, foot_gids: jax.Array) -> jax.Array:
-        """Return a jnp.bool_ indicating whether any geom in foot_gids contacts the floor."""
-        # data.contact.geom1, geom2 are arrays of geom ids; if no contacts these arrays may be empty
-        geom1 = jnp.array(data.contact.geom1)
-        geom2 = jnp.array(data.contact.geom2)
+    def _is_in_contact_with_ground(
+            self,
+            data: mjx.Data,
+            geom_ids: jax.Array
+        ) -> jax.Array:
+        """Return a jnp.bool_ indicating whether any geoms in geom_ids are in contact with the ground."""
+        # Only consider contacts with distance <= tol
+        tol = 0.001  # 1mm tolerance
+        mask = data._impl.contact.dist <= tol
+        indices = jnp.where(mask, size=mask.shape[0])[0]
+        geom = data._impl.contact.geom[indices]
 
-        if geom1.size == 0:
-            return jnp.array(False)
+        geom_ids = jnp.array(geom_ids, dtype=geom.dtype)
+        floor_gid = jnp.array(int(self._floor_gid), dtype=geom.dtype)
 
-        fg = jnp.array(foot_gids, dtype=geom1.dtype)
-        floor_gid = jnp.array(int(self._floor_gid), dtype=geom1.dtype)
-
-        match1 = jnp.any(jnp.any(geom1[:, None] == fg[None, :], axis=1) & (geom2 == floor_gid))
-        match2 = jnp.any(jnp.any(geom2[:, None] == fg[None, :], axis=1) & (geom1 == floor_gid))
+        # For each contact entry, check if either (geom[:,0] is the geom and geom[:,1] is floor)
+        # or (geom[:,1] is the geom and geom[:,0] is floor). Then reduce with any(). This
+        # naturally handles the empty-contact case (any over empty -> False).
+        match1 = jnp.any(jnp.any(geom[:, 0, None] == geom_ids[None, :], axis=1) & (geom[:, 1] == floor_gid))
+        match2 = jnp.any(jnp.any(geom[:, 1, None] == geom_ids[None, :], axis=1) & (geom[:, 0] == floor_gid))
         return jnp.logical_or(match1, match2)
 
     def _vector_com_to_support(self, data: mjx.Data) -> jax.Array:
@@ -514,27 +522,41 @@ class CassieEnv(mjx_env.MjxEnv):
         right_center = jnp.array(data.xpos[int(self._right_foot_id)])
 
         # Check contact booleans
-        left_contact = self._is_foot_in_contact_with_ground(data, self._left_foot_gid)
-        right_contact = self._is_foot_in_contact_with_ground(data, self._right_foot_gid)
+        left_foot_contact = self._is_in_contact_with_ground(data, self._left_foot_gid)
+        right_foot_contact = self._is_in_contact_with_ground(data, self._right_foot_gid)
 
         com_xy = jnp.array(data.subtree_com[0][:2])
 
-        # Both feet on the ground
-        if left_contact and right_contact:
-            a = left_center[:2]
-            b = right_center[:2]
-            ab = b - a
-            denom = jnp.dot(ab, ab) + 1e-12
-            t = jnp.clip(jnp.dot(com_xy - a, ab) / denom, 0.0, 1.0)
-            proj = a + t * ab
-            return proj - com_xy
+        # Case 1: both feet on the ground (support is a line segment)
+        a = left_center[:2]
+        b = right_center[:2]
+        ab = b - a
+        denom = jnp.dot(ab, ab) + 1e-12
+        t = jnp.clip(jnp.dot(com_xy - a, ab) / denom, 0.0, 1.0)
+        proj = a + t * ab
+        vec_both = proj - com_xy
 
-        # Single foot
-        if left_contact:
-            return left_center[:2] - com_xy
-        if right_contact:
-            return right_center[:2] - com_xy
+        # Case 2: only left foot on the ground (support is a point)
+        vec_left = left_center[:2] - com_xy
 
-        # No contact -> zero vector
-        return jnp.zeros(2)
+        # Case 3: only right foot on the ground (support is a point)
+        vec_right = right_center[:2] - com_xy
+
+        # Case 4: no feet on the ground
+        vec_none = jnp.zeros(2)
+
+        # Choose result without Python control flow so the function is jittable.
+        # Order: if both -> vec_both, else if left -> vec_left, else if right -> vec_right, else zero.
+        both = jnp.logical_and(left_foot_contact, right_foot_contact)
+        left_only = jnp.logical_and(left_foot_contact, jnp.logical_not(right_foot_contact))
+        right_only = jnp.logical_and(right_foot_contact, jnp.logical_not(left_foot_contact))
+
+        res = jnp.where(
+            both, vec_both, jnp.where(
+                left_only, vec_left, jnp.where(
+                    right_only, vec_right, vec_none
+                )
+            )
+        )
+        return res
     
