@@ -73,8 +73,8 @@ def test_action_scaling_maps_bounds(env):
     ones = jnp.ones((nu,), dtype=jnp.float32)
     neg_ones = -ones
 
-    upper = env._actuator_soft_bounds[1]
-    lower = env._actuator_soft_bounds[0]
+    upper = env._jnt_soft_uppers
+    lower = env._jnt_soft_lowers
 
     scaled_upper = env._action_norm2actual(ones)
     scaled_lower = env._action_norm2actual(neg_ones)

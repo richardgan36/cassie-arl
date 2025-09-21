@@ -277,16 +277,9 @@ class CassieEnv(mjx_env.MjxEnv):
     def _get_obs(self, data) -> jax.Array:
         """Constructs observation from mjx.Data (Cassie)."""
         # TODO: separate "state" and "privileged state"
-        # TODO: add foot contact info
-        # TODO: consider using the difference between joint angles and standing pose
-        #       as observation instead of absolute angles. Then, the output of the policy
-        #       should also be relative to the standing pose.
-        # TODO: add the vector of the COM to the closest point on the support polygon
-        #       in the XY plane
+        # TODO: We are now using joint angle deltas. Consider changing the action
+        #       to represent deltas relative to standing pose as well.
 
-        # qpos: joint + base positions
-        # qvel: joint + base velocities
-        # First 7 entries of qpos are free joint (base pos + quaternion)
         motor_qpos = data.qpos[QPosIdx.MOTORS]
         motor_qvel = data.qvel[QVelIdx.MOTORS]
         pelvis_qvel = data.qvel[QVelIdx.BASE]
@@ -298,14 +291,30 @@ class CassieEnv(mjx_env.MjxEnv):
         # Pelvis height (z coord of root)
         pelvis_height = data.qpos[QPosIdx.BASE_HEIGHT]  # shape (1,)
 
-        # Concatenate into a single vector
+        # Use difference between current motor angles and the standing pose
+        motor_qpos_delta = motor_qpos - StandingPose.MOTOR_ANGLES
+
+        # Foot contact info (left, right) as floats 0.0/1.0
+        left_contact = self._is_in_contact_with_ground(data, self._left_foot_gid)
+        right_contact = self._is_in_contact_with_ground(data, self._right_foot_gid)
+        left_contact_f = jnp.where(left_contact, 1.0, 0.0)
+        right_contact_f = jnp.where(right_contact, 1.0, 0.0)
+        foot_contact = jnp.array([left_contact_f, right_contact_f])
+
+        # Vector from COM to closest point on support polygon (XY)
+        com_to_support = self._vector_com_to_support(data)
+
+        # Concatenate into a single vector. Order chosen to keep base-state first,
+        # then motor errors and velocities, then pelvis vel, then foot contact and com->support.
         obs = jnp.concatenate([
             pelvis_height,
             pelvis_quat,
             gravity_in_pelvis_frame,
-            motor_qpos,
+            motor_qpos_delta,
             motor_qvel,
-            pelvis_qvel
+            pelvis_qvel,
+            foot_contact,
+            com_to_support,
         ])
 
         return obs
@@ -528,7 +537,12 @@ class CassieEnv(mjx_env.MjxEnv):
         return rng, p_gain, d_gain
 
     def _action_norm2actual(self, action: jax.Array) -> jax.Array:
-        """Scales normalized actions [-1, 1] to actual motor joint ranges."""
+        """
+        Scales normalized actions [-1, 1] to actual motor joint angles.
+
+        The action is interpreted as a normalized position target for each
+        of the 10 actuated joints.
+        """
         return self._jnt_soft_lowers + (action + 1) / 2.0 * (
             self._jnt_soft_uppers - self._jnt_soft_lowers
         )
