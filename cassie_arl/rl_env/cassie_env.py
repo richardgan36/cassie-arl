@@ -63,6 +63,7 @@ def default_config() -> config_dict.ConfigDict:
         reward_config=config_dict.create(
             scales=config_dict.create(
                 alive=1.0,
+                com_outside_support=-0.5,
                 fall=-5.0,
                 pelvis_lin_vel=-0.2,
                 pelvis_tilt=-0.1,
@@ -108,7 +109,20 @@ class CassieEnv(mjx_env.MjxEnv):
 
         self._torque_lowers, self._torque_uppers = self._mj_model.actuator_ctrlrange.T
 
-        # self._pelvis_id = self._mj_model.body("cassie-pelvis").id
+        # MJCF geom and body IDs
+        def geoms_of_body(model, body_id):
+            start = model.body_geomadr[body_id]
+            count = model.body_geomnum[body_id]
+            geom_ids = jnp.arange(start, start + count)
+            return geom_ids
+        
+        self._floor_gid = self._mj_model.geom('floor').id
+        self._pelvis_id = self._mj_model.body("cassie-pelvis").id
+        self._left_foot_id = self._mj_model.body("left-foot").id
+        self._right_foot_id = self._mj_model.body("right-foot").id
+
+        self._left_foot_gid = geoms_of_body(self._left_foot_id)
+        self._right_foot_gid = geoms_of_body(self._right_foot_id)
 
         self._p_gain = self._config.p_gain
         self._d_gain = self._config.d_gain
@@ -255,6 +269,8 @@ class CassieEnv(mjx_env.MjxEnv):
         # TODO: consider using the difference between joint angles and standing pose
         #       as observation instead of absolute angles. Then, the output of the policy
         #       should also be relative to the standing pose.
+        # TODO: add the vector of the COM to the closest point on the support polygon
+        #       in the XY plane
 
         # qpos: joint + base positions
         # qvel: joint + base velocities
@@ -298,11 +314,29 @@ class CassieEnv(mjx_env.MjxEnv):
 
         return {
             "alive": self._reward_alive(data),
+            "com_outside_support": self._cost_com_outside_support(data),
             "fall": self._cost_fall(data),
             "pelvis_lin_vel": self._cost_pelvis_lin_vel(data),
             "pelvis_tilt": self._cost_pelvis_tilt(data),
             "motor_ref_error": self._cost_motor_reference_error(data),
         }
+
+    def _cost_com_outside_support(self, data: mjx.Data) -> jax.Array:
+        """
+        Cost for distance of the center of mass from the support polygon.
+
+        The support polygon is a line segment if both feet are on the ground,
+        or a point if one foot is on the ground. If both feet are in the air,
+        the cost is zero. Cost for being airborne is penalized in _cost_airborne.
+        """
+        # Compute simplified distance to support (segment/point)
+        vec_to_support = self._vector_com_to_support(data)
+        dist = jnp.linalg.norm(vec_to_support)
+
+        # Exponential scaling: reaches 0.4 at distance == sigma
+        sigma = 0.07
+        cost = 1 - jnp.exp(- (dist**2) / (2 * sigma**2))
+        return jnp.clip(cost, 0.0, 1.0)
 
     def _reward_alive(self, data: mjx.Data) -> jax.Array:
         """Reward for staying 'alive' (not falling over)."""
@@ -348,25 +382,13 @@ class CassieEnv(mjx_env.MjxEnv):
         cost = jnp.mean((err / err_scale)**2)
         return jnp.clip(cost, 0, 1)
     
-
-
     def _get_termination(self, data: mjx.Data, step: jax.Array) -> jax.Array:
         """Return True if Cassie has fallen or max timesteps reached."""
-        # Pelvis height (z-coordinate)
         fallen = self._has_fallen(data)
 
         max_steps = jnp.array(self._config.episode_length, dtype=step.dtype)
         max_steps_reached = step >= max_steps
 
-        # Approximate tarsus (toe) positions
-        # For simplicity, assume fixed offsets from pelvis for standing
-        # Left and right toe z positions
-        # left_toe_z = pelvis_z - 1.0  # adjust based on leg length
-        # right_toe_z = pelvis_z - 1.0
-
-        # toe_hit_ground = jnp.any(jnp.array([left_toe_z, right_toe_z]) <= TARSUS_HITGROUND_THRESHOLD)
-
-        # return fallen | toe_hit_ground
         done = jnp.logical_or(fallen, max_steps_reached)
         return done
     
@@ -461,3 +483,58 @@ class CassieEnv(mjx_env.MjxEnv):
         """Returns True if Cassie has fallen (pelvis height below threshold)."""
         pelvis_z = data.qpos[QPosIdx.BASE_HEIGHT].squeeze()
         return pelvis_z < FALLING_THRESHOLD
+
+
+    # ---------------- Support polygon & COM helpers ----------------
+    def _is_foot_in_contact_with_ground(self, data: mjx.Data, foot_gids: jax.Array) -> jax.Array:
+        """Return a jnp.bool_ indicating whether any geom in foot_gids contacts the floor."""
+        # data.contact.geom1, geom2 are arrays of geom ids; if no contacts these arrays may be empty
+        geom1 = jnp.array(data.contact.geom1)
+        geom2 = jnp.array(data.contact.geom2)
+
+        if geom1.size == 0:
+            return jnp.array(False)
+
+        fg = jnp.array(foot_gids, dtype=geom1.dtype)
+        floor_gid = jnp.array(int(self._floor_gid), dtype=geom1.dtype)
+
+        match1 = jnp.any(jnp.any(geom1[:, None] == fg[None, :], axis=1) & (geom2 == floor_gid))
+        match2 = jnp.any(jnp.any(geom2[:, None] == fg[None, :], axis=1) & (geom1 == floor_gid))
+        return jnp.logical_or(match1, match2)
+
+    def _vector_com_to_support(self, data: mjx.Data) -> jax.Array:
+        """
+        Compute vector from COM projection to closest point on support geometry.
+
+        Returns a 2D vector (COM_xy -> closest point on support). 
+        If no feet contact the ground, returns zero vector.
+        """
+        # Foot centers in world frame
+        left_center = jnp.array(data.xpos[int(self._left_foot_id)])
+        right_center = jnp.array(data.xpos[int(self._right_foot_id)])
+
+        # Check contact booleans
+        left_contact = self._is_foot_in_contact_with_ground(data, self._left_foot_gid)
+        right_contact = self._is_foot_in_contact_with_ground(data, self._right_foot_gid)
+
+        com_xy = jnp.array(data.subtree_com[0][:2])
+
+        # Both feet on the ground
+        if left_contact and right_contact:
+            a = left_center[:2]
+            b = right_center[:2]
+            ab = b - a
+            denom = jnp.dot(ab, ab) + 1e-12
+            t = jnp.clip(jnp.dot(com_xy - a, ab) / denom, 0.0, 1.0)
+            proj = a + t * ab
+            return proj - com_xy
+
+        # Single foot
+        if left_contact:
+            return left_center[:2] - com_xy
+        if right_contact:
+            return right_center[:2] - com_xy
+
+        # No contact -> zero vector
+        return jnp.zeros(2)
+    
