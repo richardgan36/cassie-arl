@@ -226,6 +226,7 @@ def visualize_policy(current_step: int, make_policy, params):
 
         traj = []
         com_info_list = []  # store COM, distance, contacts, reward
+        lift_foot_info_list = []  # store foot heights and reward
         logging.info("Starting rollout")
         for i in range(env_cfg.episode_length):
             act_rng, rng = jax.random.split(rng)
@@ -248,19 +249,20 @@ def visualize_policy(current_step: int, make_policy, params):
                 "left_contact": left_contact,
                 "right_contact": right_contact,
                 "cost": com_cost,
-                # "geom1": np.array(state.data._impl.contact.geom[:, 0]),
-                # "geom2": np.array(state.data._impl.contact.geom[:, 1]),
             })
 
-            # # Filter the contacts by distance within a tolerance
-            # tol = 0.001  # 1 mm tolerance
-            # dists = state.data._impl.contact.dist
-            # valid_contact_indices = np.where(dists <= tol)[0]
-            # valid_dists = dists[valid_contact_indices]
-            # valid_geom1 = state.data._impl.contact.geom[valid_contact_indices, 0]
-            # valid_geom2 = state.data._impl.contact.geom[valid_contact_indices, 1]
-
-            # logging.info(f"Geom1: {valid_geom1}\n Geom2: {valid_geom2}\n Distances: {valid_dists}\n\n")
+            # ---- Foot lift info ----
+            # Use body positions (xpos) for foot z coordinates; Data may not expose 'site'
+            left_foot_z = float(np.array(state.data.xpos[env._left_foot_id, 2])) - 0.057
+            right_foot_z = float(np.array(state.data.xpos[env._right_foot_id, 2])) - 0.057
+            lift_foot_reward = float(state.info["reward_components"]["lift_foot"])
+            lift_foot_info_list.append({
+                "lift_foot_given": bool(state.info["lift_foot_given"]),
+                "left_foot_z": left_foot_z,
+                "right_foot_z": right_foot_z,
+                "reward": lift_foot_reward,
+                "com_outside_support":  dist_to_support > 0.06,
+            })
 
         if len(traj) == 0:
             logging.warning("No frames collected; skipping.")
@@ -279,16 +281,27 @@ def visualize_policy(current_step: int, make_policy, params):
         frames_overlay = []
         for f_idx, frame in enumerate(frames):
             frame_rgb = np.array(frame).copy()
-            info = com_info_list[f_idx]
+            com_info = com_info_list[f_idx]
 
-            com = info['com']
+            com = com_info['com']
+
+            lift_foot_info = lift_foot_info_list[f_idx]
+            left_foot_z = lift_foot_info['left_foot_z']
+            right_foot_z = lift_foot_info['right_foot_z']
+            lift_foot_given = lift_foot_info['lift_foot_given']
+            lift_foot_reward = lift_foot_info['reward']
+            com_outside_support = lift_foot_info['com_outside_support']
 
             # Add text
             text_lines = [
                 f"COM: ({com[0]:.3f}, {com[1]:.3f}, {com[2]:.3f})",
-                f"COM->Support dist: {info['dist']:.3f} m",
-                f"L_contact: {info['left_contact']}, R_contact: {info['right_contact']}",
-                f"COM cost: {info['cost']:.3f}",
+                f"COM->Support dist: {com_info['dist']:.3f} m",
+                f"L_contact: {com_info['left_contact']}, R_contact: {com_info['right_contact']}",
+                f"COM cost: {com_info['cost']:.3f}",
+                f"Left foot z: {left_foot_z:.3f} m",
+                f"Right foot z: {right_foot_z:.3f} m",
+                f"Lift foot reward: {lift_foot_reward:.3f} (given: {lift_foot_given})",
+                f"COM outside support: {com_outside_support}"
             ]
             for idx, line in enumerate(text_lines):
                 cv2.putText(frame_rgb, line, (10, 30 + idx*25),

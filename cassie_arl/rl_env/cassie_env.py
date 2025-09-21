@@ -67,15 +67,24 @@ def default_config() -> config_dict.ConfigDict:
                 com_outside_support=-0.4,
                 pelvis_lin_vel=-0.2,
                 pelvis_tilt=-0.1,
-                motor_ref_error=-0.2
+                motor_ref_error=-0.2,
+                airborne=-0.2,
+                # Reward for lifting exactly one foot when COM is far from support
+                lift_foot=0.3,
             ),
         ),
+        # Parameters for the "lift foot" reward
+        # If the COM is further than `com_outside_support_threshold` (m) from the
+        # support polygon and exactly one foot is lifted with at least
+        # `lift_foot_clearance` (m) clearance from the ground, the
+        # environment returns a binary reward (1.0) for that component.
+        com_outside_support_threshold=0.06,     # meters
+        lift_foot_clearance=0.025,              # meters
     )
 
 
 class CassieEnv(mjx_env.MjxEnv):
     """Cassie environment built on MJX, compatible with Brax PPO."""
-    # TODO: replace manual rendering in train_cassie with render method for better debugging
     # TODO: add random pushes to improve robustness
     # TODO: add metrics
 
@@ -177,8 +186,12 @@ class CassieEnv(mjx_env.MjxEnv):
                 "pelvis_tilt": jnp.zeros(()),
                 "motor_ref_error": jnp.zeros(()),
                 "com_outside_support": jnp.zeros(()),
+                "airborne": jnp.zeros(()),
+                "lift_foot": jnp.zeros(()),
             },
             "action": jnp.zeros((self.action_size,)), 
+            # Whether the one-time "lift foot" reward has been granted
+            "lift_foot_given": jnp.array(False),
         }
 
         return mjx_env.State(
@@ -227,35 +240,31 @@ class CassieEnv(mjx_env.MjxEnv):
             self._mjx_model, state.data, torques, self.n_substeps
         )
 
-        # jax.debug.print("data.contact: {}", data.contact)
-
         obs = self._get_obs(data)
 
-        rewards = self._get_reward(data, action)
+        # Get reward components. `_get_reward` returns ((per_step_raw, event_raw), lift_given_new)
+        (per_step_raw, event_raw), lift_given_new = self._get_reward(data, action, state.info)
 
-        # for k, v in rewards.items():
-        #     jax.debug.print("{}: {}", k, v)
-            
-        rewards = {
-            k: v * self._config.reward_config.scales[k] for k, v in rewards.items()
-        }
-        reward = sum(rewards.values()) * self.dt
+        # Scale each component by its configured weight
+        per_step_scaled = {k: per_step_raw[k] * self._config.reward_config.scales[k] for k in per_step_raw}
+        event_scaled = {k: event_raw[k] * self._config.reward_config.scales[k] for k in event_raw}
+
+        # Per-step components are integrated over dt; event components are added directly
+        reward = sum(per_step_scaled.values()) * self.dt + sum(event_scaled.values())
         reward = jnp.clip(reward, -1000, 1000)
-
-        # jax.debug.print("scalar reward: {}", reward)
 
         new_step = state.info.get("step", 0) + 1
         
         done = self._get_termination(data, jnp.array(new_step))
         done = jnp.array(done, dtype=reward.dtype)
 
-        # new_info = {**state.info, "step": new_step, "rng": rng}
         new_info = {
             **state.info,
             "step": new_step,
             "rng": rng,
-            "reward_components": rewards,  # For debugging
-            "action": action               # For debugging
+            "reward_components": {**per_step_scaled, **event_scaled},   # For debugging
+            "action": action,                                           # For debugging
+            "lift_foot_given": lift_given_new,
         }
         return state.replace(
             data=data,
@@ -301,7 +310,7 @@ class CassieEnv(mjx_env.MjxEnv):
 
         return obs
 
-    def _get_reward(self, data: mjx.Data, action: jax.Array) -> dict[str, jax.Array]:
+    def _get_reward(self, data: mjx.Data, action: jax.Array, info: Dict[str, Any]) -> tuple[tuple[dict[str, jax.Array], dict[str, jax.Array]], jax.Array]:
         """
         Computes reward components.
 
@@ -310,31 +319,90 @@ class CassieEnv(mjx_env.MjxEnv):
         """
         # TODO: IMPORTANT: need to reward active recovery strategies, not just standing still
         # TODO: look into selective/adaptive rewards e.g. lift costs for movement when perturbing robot
-        # TODO: reward for COM above support polygon
         # TODO: cost for large change in acceleration
         # TODO: cost for large torques
-        # TODO: both feet in air penalty?
+        # TODO: reward for placing foot down depending on how close COM is to support polygon
 
-        return {
-            "alive": self._reward_alive(data),
-            "fall": self._cost_fall(data),
+        # Split components into per-step (integrated over dt) and event (one-time) rewards.
+        per_step = {
+            "alive": self._reward_alive(),
             "com_outside_support": self._cost_com_outside_support(data),
             "pelvis_lin_vel": self._cost_pelvis_lin_vel(data),
             "pelvis_tilt": self._cost_pelvis_tilt(data),
             "motor_ref_error": self._cost_motor_reference_error(data),
+            "airborne": self._cost_airborne(data),
         }
 
-    def _reward_alive(self, data: mjx.Data) -> jax.Array:
+        # Event-style components (one-time when triggered)
+        event = {
+            "fall": self._cost_fall(data),
+        }
+
+        # Compute lift_foot component and updated flag using event logic
+        lift_comp, lift_given_new = self._reward_lift_foot_to_recover(data, info["lift_foot_given"])
+        event["lift_foot"] = lift_comp
+
+        return (per_step, event), lift_given_new
+
+    def _reward_lift_foot_to_recover(
+            self,
+            data: mjx.Data,
+            lift_foot_given: jax.Array
+        ) -> tuple[jax.Array, jax.Array]:
+        """
+        Reward 1.0 when COM is 'outside' the support polygon and
+        exactly one foot is lifted by at least `lift_foot_clearance`.
+
+        This encourages active recovery strategies (lifting one foot to reach
+        or step) instead of keeping both feet planted and falling.
+        Cassie is considered 'outside' the support polygon if the distance
+        from the COM to the support polygon is greater than a threshold.
+
+        Args:
+            lift_foot_given: Boolean flag indicating whether the one-time
+                reward has already been given for the current "COM outside"
+                event. If True, no further reward is given until the COM
+                returns inside the support polygon and then goes outside again.
+        """
+        # Distance vector from COM to support (2D)
+        vec = self._vector_com_to_support(data)
+        dist = jnp.linalg.norm(vec)
+
+        # Check COM beyond threshold
+        com_outside_support = dist >= self._config.com_outside_support_threshold
+
+        # Foot clearances using body z positions (world frame)
+        left_z = jnp.array(data.xpos[self._left_foot_id, 2]) - FOOT_OFFSET
+        right_z = jnp.array(data.xpos[self._right_foot_id, 2]) - FOOT_OFFSET
+
+        left_lifted = left_z >= self._config.lift_foot_clearance
+        right_lifted = right_z >= self._config.lift_foot_clearance
+
+        # Exactly one foot lifted
+        exactly_one = jnp.logical_xor(left_lifted, right_lifted)
+
+        # Should we give reward now? Event active (COM outside), not given yet for
+        # this active period, and exactly one foot lifted.
+        give_now = jnp.logical_and(jnp.logical_and(com_outside_support, jnp.logical_not(lift_foot_given)), exactly_one)
+
+        # Raw component: if giving now, return 1.0 as a one-time event reward.
+        cost = jnp.where(give_now, 1.0, 0.0)
+
+        # Update flag: if COM is outside, keep previous or set flag if we just gave the reward.
+        # If COM is inside, reset the flag so future outside-events can be rewarded
+        lift_given_new = jnp.where(com_outside_support, jnp.logical_or(lift_foot_given, give_now), jnp.array(False))
+
+        return cost, lift_given_new
+
+    def _reward_alive(self) -> jax.Array:
         """Reward for staying 'alive' (not falling over)."""
         return jnp.array(1.0)
     
     def _cost_fall(self, data: mjx.Data) -> jax.Array:
         """One time cost for falling over."""
         fallen = self._has_fallen(data)
-        # If fallen, return 1.0 / self.dt. Divide by self.dt because all reward
-        # components are multipled by self.dt in the step function.
-        # _cost_fall is a one-time cost so should not be normalized by self.dt.
-        return jnp.where(fallen, 1.0 / self.dt, 0.0)
+        # If fallen, return 1.0 as a one-time event cost. The caller will add
+        return jnp.where(fallen, 1.0, 0.0)
 
     def _cost_com_outside_support(self, data: mjx.Data) -> jax.Array:
         """
@@ -349,7 +417,7 @@ class CassieEnv(mjx_env.MjxEnv):
         dist = jnp.linalg.norm(vec_to_support)
 
         # Exponential scaling: reaches 0.4 at distance == sigma
-        sigma = 0.07
+        sigma = self._config.com_outside_support_threshold
         cost = 1 - jnp.exp(- (dist**2) / (2 * sigma**2))
         return jnp.clip(cost, 0.0, 1.0)
     
@@ -384,6 +452,14 @@ class CassieEnv(mjx_env.MjxEnv):
         err_scale = 0.35  # Normalizing constant (radians)
         cost = jnp.mean((err / err_scale)**2)
         return jnp.clip(cost, 0, 1)
+    
+    def _cost_airborne(self, data: mjx.Data) -> jax.Array:
+        """Cost for having both feet off the ground."""
+        left_foot_contact = self._is_in_contact_with_ground(data, self._left_foot_gid)
+        right_foot_contact = self._is_in_contact_with_ground(data, self._right_foot_gid)
+
+        airborne = jnp.logical_and(jnp.logical_not(left_foot_contact), jnp.logical_not(right_foot_contact))
+        return jnp.where(airborne, 1.0, 0.0)
     
     def _get_termination(self, data: mjx.Data, step: jax.Array) -> jax.Array:
         """Return True if Cassie has fallen or max timesteps reached."""
@@ -501,7 +577,7 @@ class CassieEnv(mjx_env.MjxEnv):
         geom = data._impl.contact.geom[indices]
 
         geom_ids = jnp.array(geom_ids, dtype=geom.dtype)
-        floor_gid = jnp.array(int(self._floor_gid), dtype=geom.dtype)
+        floor_gid = jnp.array(self._floor_gid, dtype=geom.dtype)
 
         # For each contact entry, check if either (geom[:,0] is the geom and geom[:,1] is floor)
         # or (geom[:,1] is the geom and geom[:,0] is floor). Then reduce with any(). This
@@ -518,8 +594,8 @@ class CassieEnv(mjx_env.MjxEnv):
         If no feet contact the ground, returns zero vector.
         """
         # Foot centers in world frame
-        left_center = jnp.array(data.xpos[int(self._left_foot_id)])
-        right_center = jnp.array(data.xpos[int(self._right_foot_id)])
+        left_center = jnp.array(data.xpos[self._left_foot_id])
+        right_center = jnp.array(data.xpos[self._right_foot_id])
 
         # Check contact booleans
         left_foot_contact = self._is_in_contact_with_ground(data, self._left_foot_gid)
