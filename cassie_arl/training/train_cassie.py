@@ -2,6 +2,7 @@
 from datetime import datetime
 import functools
 from pathlib import Path
+import os
 
 # Third-party packages
 from brax.training.agents.ppo import networks as ppo_networks
@@ -20,7 +21,7 @@ import cv2
 from cassie_arl.rl_env.cassie_env import CassieEnv, default_config
 from cassie_arl.rl_env.cassie_domain_randomizer import domain_randomize
 
-
+os.environ["ABSL_LOG_PREFIX"] = "1"
 script_dir = Path(__file__).parent.resolve()
 
 logging.set_verbosity(logging.INFO)
@@ -50,9 +51,9 @@ ppo_training_params = {
     'num_resets_per_eval': 1,
     'num_timesteps': 200_000_000,
     'num_updates_per_batch': 4,
-    'reward_scaling': 1.0,
+    'reward_scaling': 2.0,
     'unroll_length': 20,
-    'restore_value_fn': True
+    'restore_value_fn': True,
 }
 
 
@@ -268,7 +269,7 @@ def visualize_policy(current_step: int, make_policy, params):
             })
 
             # ---- Foot lift info ----
-            # Use body positions (xpos) for foot z coordinates; Data may not expose 'site'
+            # Use body positions (xpos) for foot z coordinates;
             left_foot_z = float(np.array(state.data.xpos[env._left_foot_id, 2])) - 0.057
             right_foot_z = float(np.array(state.data.xpos[env._right_foot_id, 2])) - 0.057
             lift_foot_reward = float(state.info["reward_components"]["lift_foot"])
@@ -310,7 +311,7 @@ def visualize_policy(current_step: int, make_policy, params):
             text_lines = [
                 f"COM->Support dist: {com_info['dist']:.3f} m",
                 f"COM outside support: {com_outside_support}",
-                f"L_contact: {com_info['left_contact']}, R_contact: {com_info['right_contact']}",
+                f"L contact: {com_info['left_contact']}, R contact: {com_info['right_contact']}",
                 f"COM cost: {com_info['cost']:.3f}",
                 f"Left foot z: {left_foot_z:.3f} m",
                 f"Right foot z: {right_foot_z:.3f} m",

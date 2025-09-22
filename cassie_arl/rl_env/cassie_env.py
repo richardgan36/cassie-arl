@@ -344,7 +344,6 @@ class CassieEnv(mjx_env.MjxEnv):
             "motor_ref_error": self._cost_motor_reference_error(data),
             "airborne": self._cost_airborne(data),
             "action_rate": self._cost_action_rate(action, info["last_act"]),
-
         }
 
         # Event-style components (one-time when triggered)
