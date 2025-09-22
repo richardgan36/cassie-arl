@@ -189,6 +189,7 @@ class CassieEnv(mjx_env.MjxEnv):
                 "com_outside_support": jnp.zeros(()),
                 "airborne": jnp.zeros(()),
                 "lift_foot": jnp.zeros(()),
+                "action_rate": jnp.zeros(())
             },
             "action": jnp.zeros((self.action_size,)), 
             "last_act": jnp.zeros((self.action_size,)),
@@ -483,6 +484,7 @@ class CassieEnv(mjx_env.MjxEnv):
 
     def _get_termination(self, data: mjx.Data, step: jax.Array) -> jax.Array:
         """Return True if Cassie has fallen or max timesteps reached."""
+        # TODO: add tarsus hit ground condition
         fallen = self._has_fallen(data)
 
         max_steps = jnp.array(self._config.episode_length, dtype=step.dtype)
@@ -513,13 +515,13 @@ class CassieEnv(mjx_env.MjxEnv):
         # qpos[MOTORS]=*U(0.8, 1.2)
         rng, key = jax.random.split(rng)
         qpos = qpos.at[QPosIdx.MOTORS].set(
-            qpos[QPosIdx.MOTORS] * jax.random.uniform(key, (10,), minval=0.8, maxval=1.2)
+            qpos[QPosIdx.MOTORS] * jax.random.uniform(key, (10,), minval=0.9, maxval=1.1)
         )
 
         # d(xyzrpy)=U(-0.5, 0.5)
         rng, key = jax.random.split(rng)
         qvel = qvel.at[QVelIdx.BASE].add(
-            jax.random.uniform(key, (6,), minval=-0.5, maxval=0.5)
+            jax.random.uniform(key, (6,), minval=-0.2, maxval=0.2)
         )
 
         return rng, qpos, qvel
