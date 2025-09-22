@@ -62,15 +62,16 @@ def default_config() -> config_dict.ConfigDict:
         # are in [0, 1] and all cost weights are in [-1, 0].
         reward_config=config_dict.create(
             scales=config_dict.create(
-                alive=1.0,
+                alive=2.0,
                 fall=-5.0,
                 com_outside_support=-0.4,
                 pelvis_lin_vel=-0.2,
                 pelvis_tilt=-0.1,
                 motor_ref_error=-0.2,
-                airborne=-0.2,
+                airborne=-0.4,
                 # Reward for lifting exactly one foot when COM is far from support
-                lift_foot=0.3,
+                lift_foot=0.2,
+                action_rate=-0.01,
             ),
         ),
         # Parameters for the "lift foot" reward
@@ -190,6 +191,7 @@ class CassieEnv(mjx_env.MjxEnv):
                 "lift_foot": jnp.zeros(()),
             },
             "action": jnp.zeros((self.action_size,)), 
+            "last_act": jnp.zeros((self.action_size,)),
             # Whether the one-time "lift foot" reward has been granted
             "lift_foot_given": jnp.array(False),
         }
@@ -263,7 +265,7 @@ class CassieEnv(mjx_env.MjxEnv):
             "step": new_step,
             "rng": rng,
             "reward_components": {**per_step_scaled, **event_scaled},   # For debugging
-            "action": action,                                           # For debugging
+            "last_act": action,  # For action rate cost
             "lift_foot_given": lift_given_new,
         }
         return state.replace(
@@ -302,7 +304,8 @@ class CassieEnv(mjx_env.MjxEnv):
         foot_contact = jnp.array([left_contact_f, right_contact_f])
 
         # Vector from COM to closest point on support polygon (XY)
-        com_to_support = self._vector_com_to_support(data)
+        com_to_support_world = self._vector_com_to_support(data)
+        com_to_support_pelvis = math_utils.vec_xy_world_to_base(com_to_support_world, pelvis_quat)
 
         # Concatenate into a single vector. Order chosen to keep base-state first,
         # then motor errors and velocities, then pelvis vel, then foot contact and com->support.
@@ -314,7 +317,7 @@ class CassieEnv(mjx_env.MjxEnv):
             motor_qvel,
             pelvis_qvel,
             foot_contact,
-            com_to_support,
+            com_to_support_pelvis,
         ])
 
         return obs
@@ -328,7 +331,7 @@ class CassieEnv(mjx_env.MjxEnv):
         """
         # TODO: IMPORTANT: need to reward active recovery strategies, not just standing still
         # TODO: look into selective/adaptive rewards e.g. lift costs for movement when perturbing robot
-        # TODO: cost for large change in acceleration
+        # TODO: cost for large action rate
         # TODO: cost for large torques
         # TODO: reward for placing foot down depending on how close COM is to support polygon
 
@@ -340,6 +343,8 @@ class CassieEnv(mjx_env.MjxEnv):
             "pelvis_tilt": self._cost_pelvis_tilt(data),
             "motor_ref_error": self._cost_motor_reference_error(data),
             "airborne": self._cost_airborne(data),
+            "action_rate": self._cost_action_rate(action, info["last_act"]),
+
         }
 
         # Event-style components (one-time when triggered)
@@ -470,6 +475,13 @@ class CassieEnv(mjx_env.MjxEnv):
         airborne = jnp.logical_and(jnp.logical_not(left_foot_contact), jnp.logical_not(right_foot_contact))
         return jnp.where(airborne, 1.0, 0.0)
     
+    def _cost_action_rate(self, act: jax.Array, last_act: jax.Array) -> jax.Array:
+        """Cost for large changes in action between steps."""
+        # Action is [-1, 1], which maps to the full range of motor motion.
+        scaling_factor = 10.0 * self.dt  # Max cost when moving full range in 0.2s
+        cost = jnp.sum(jnp.square(act - last_act) / scaling_factor**2) / act.size
+        return jnp.clip(cost, 0, 1)
+
     def _get_termination(self, data: mjx.Data, step: jax.Array) -> jax.Array:
         """Return True if Cassie has fallen or max timesteps reached."""
         fallen = self._has_fallen(data)
@@ -484,18 +496,17 @@ class CassieEnv(mjx_env.MjxEnv):
             self, rng: jax.Array, qpos: jax.Array, qvel: jax.Array
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         """Add uniform random perturbations to base and motor positions/velocities."""
-        # x=+U(-0.5, 0.5), y=+U(-0.5, 0.5), z=+U(0, 0.2), yaw=U(-3.14, 3.14).
+        # x=+U(-0.5, 0.5), y=+U(-0.5, 0.5), z=+U(0, 0.1), yaw=U(-3.14, 3.14).
         rng, key = jax.random.split(rng)
         dxy = jax.random.uniform(key, (2,), minval=-0.5, maxval=0.5)
 
         rng, key = jax.random.split(rng)
-        dz = jax.random.uniform(key, (1,), minval=0.0, maxval=0.2)
+        dz = jax.random.uniform(key, (1,), minval=0.0, maxval=0.1)
 
         rng, key = jax.random.split(rng)
         yaw = jax.random.uniform(key, (1,), minval=-3.14, maxval=3.14)
         quat = math_utils.euler2quat(jnp.array([0.0, 0.0, yaw[0]]))
 
-        
         qpos = qpos.at[QPosIdx.BASE_XY].add(dxy)
         qpos = qpos.at[QPosIdx.BASE_HEIGHT].add(dz)
         qpos = qpos.at[QPosIdx.BASE_QUAT].set(quat)
@@ -604,7 +615,7 @@ class CassieEnv(mjx_env.MjxEnv):
         """
         Compute vector from COM projection to closest point on support geometry.
 
-        Returns a 2D vector (COM_xy -> closest point on support). 
+        Returns a 2D vector (COM_xy -> closest point on support in world frame). 
         If no feet contact the ground, returns zero vector.
         """
         # Foot centers in world frame
@@ -641,12 +652,13 @@ class CassieEnv(mjx_env.MjxEnv):
         left_only = jnp.logical_and(left_foot_contact, jnp.logical_not(right_foot_contact))
         right_only = jnp.logical_and(right_foot_contact, jnp.logical_not(left_foot_contact))
 
-        res = jnp.where(
+        res_world = jnp.where(
             both, vec_both, jnp.where(
                 left_only, vec_left, jnp.where(
                     right_only, vec_right, vec_none
                 )
             )
         )
-        return res
-    
+
+        return res_world
+

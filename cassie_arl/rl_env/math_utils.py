@@ -75,16 +75,48 @@ def angle_diff(angle1: jax.Array, angle2: jax.Array) -> jax.Array:
     return (diff + jnp.pi) % (2 * jnp.pi) - jnp.pi
 
 
-def gravity_in_base_frame(quat: jax.Array) -> jax.Array:
+def quat2mat(quat: jax.Array) -> jax.Array:
+    """
+    Convert quaternion [w, x, y, z] to a 3x3 rotation matrix R that maps
+    vectors from the base frame to the world frame.
+
+    Args:
+        quat: jax.Array of shape (4,) or (..., 4)
+
+    Returns:
+        jax.Array of shape (3, 3) or (..., 3, 3)
+    """
+    w, x, y, z = quat[..., 0], quat[..., 1], quat[..., 2], quat[..., 3]
+
+    R = jnp.stack([
+        jnp.stack([1-2*(y**2+z**2), 2*(x*y - w*z), 2*(x*z + w*y)], axis=-1),
+        jnp.stack([2*(x*y + w*z), 1-2*(x**2+z**2), 2*(y*z - w*x)], axis=-1),
+        jnp.stack([2*(x*z - w*y), 2*(y*z + w*x), 1-2*(x**2+y**2)], axis=-1),
+    ], axis=-2)
+    return R
+
+
+def gravity_in_base_frame(base_quat: jax.Array) -> jax.Array:
     """Compute gravity vector in the base frame given the base quaternion."""
     # quat: [w, x, y, z]
-    w, x, y, z = quat
-    # Rotation matrix from quaternion
-    R = jnp.array([
-        [1-2*(y**2+z**2), 2*(x*y - w*z), 2*(x*z + w*y)],
-        [2*(x*y + w*z), 1-2*(x**2+z**2), 2*(y*z - w*x)],
-        [2*(x*z - w*y), 2*(y*z + w*x), 1-2*(x**2+y**2)]
-    ])
+    R = quat2mat(base_quat)
     g_world = jnp.array([0., 0., -9.81])
+    # R maps base->world, so R.T maps world->base
     return R.T @ g_world
 
+
+def vec_xy_world_to_base(
+        vec_world: jax.Array,
+        base_quat: jax.Array,
+    ) -> jax.Array:
+    """Convert a 2D vector in the XY plane from world frame to base frame."""
+    base_euler = quat2euler(base_quat)
+    yaw = base_euler[..., 2]
+
+    c = jnp.cos(-yaw)
+    s = jnp.sin(-yaw)
+
+    x = vec_world[..., 0]
+    y = vec_world[..., 1]
+    # Rotation by -yaw to go from world -> pelvis
+    return jnp.array([c * x - s * y, s * x + c * y])
