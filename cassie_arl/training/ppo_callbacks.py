@@ -41,6 +41,21 @@ class ProgressCallback:
         self.y_data.append(metrics["eval/episode_reward"])
         self.y_dataerr.append(metrics["eval/episode_reward_std"])
 
+        print("")
+        logging.info("--- Progress update ---")
+        logging.info(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+        if len(self.times) == 2:
+            time_to_jit = self.times[-1] - self.times[0]
+            logging.info(f"Steps: {num_steps}, Reward: {self.y_data[-1]:.3f} ± {self.y_dataerr[-1]:.3f}")
+            logging.info(f"Time to jit: {time_to_jit}")
+        else:
+            delta = self.times[-1] - self.times[-2]
+            last_step = self.x_data[-2] if len(self.x_data) >= 2 else None
+            logging.info(f"Steps: {num_steps}, Reward: {self.y_data[-1]:.3f} ± {self.y_dataerr[-1]:.3f}")
+            logging.info(f"Time since last progress call (steps {last_step} -> {num_steps}): {delta}")
+        print("-----------------")
+
         plt.clf()  # Clear the current figure
         plt.errorbar(self.x_data, self.y_data, yerr=self.y_dataerr, color="blue")
         plt.xlim([0, self.training_params["num_timesteps"] * 1.25])
@@ -57,21 +72,7 @@ class ProgressCallback:
         save_path.parent.mkdir(parents=True, exist_ok=True)
         plt.savefig(str(save_path), dpi=150, bbox_inches="tight")
 
-        print("")
-        logging.info("--- Progress update ---")
-        logging.info(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-        if len(self.times) == 2:
-            time_to_jit = self.times[-1] - self.times[0]
-            logging.info(f"Steps: {num_steps}, Reward: {self.y_data[-1]:.3f} ± {self.y_dataerr[-1]:.3f}")
-            logging.info(f"Time to jit: {time_to_jit}")
-        else:
-            delta = self.times[-1] - self.times[-2]
-            last_step = self.x_data[-2] if len(self.x_data) >= 2 else None
-            logging.info(f"Steps: {num_steps}, Reward: {self.y_data[-1]:.3f} ± {self.y_dataerr[-1]:.3f}")
-            logging.info(f"Time since last progress call (steps {last_step} -> {num_steps}): {delta}")
-
-        print("-----------------")
 
 
 class VisualizePolicyCallback:

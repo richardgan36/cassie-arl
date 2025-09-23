@@ -63,10 +63,10 @@ def default_config() -> config_dict.ConfigDict:
         reward_config=config_dict.create(
             scales=config_dict.create(
                 alive=2.0,
-                fall=-5.0,
+                fall=-8.0,
                 com_outside_support=-0.4,
                 pelvis_lin_vel=-0.2,
-                pelvis_tilt=-0.1,
+                pelvis_tilt=-0.2,
                 motor_ref_error=-0.3,
                 airborne=-1.0,
                 # Reward for lifting exactly one foot when COM is far from support
@@ -192,14 +192,14 @@ class CassieEnv(mjx_env.MjxEnv):
                 "motor_ref_error": jnp.zeros(()),
                 "com_outside_support": jnp.zeros(()),
                 "airborne": jnp.zeros(()),
-                "lift_foot": jnp.zeros(()),
+                # "lift_foot": jnp.zeros(()),
                 "reduce_com_error": jnp.zeros(()),
                 "action_rate": jnp.zeros(())
             },
             "action": jnp.zeros((self.action_size,)), 
             "last_act": jnp.zeros((self.action_size,)),
             # Whether the one-time "lift foot" reward has been granted
-            "lift_foot_given": jnp.array(False),
+            # "lift_foot_given": jnp.array(False),
             # Previous foot contact information
             "prev_both_feet_contact": jnp.array(False),
             # Last COM error when both feet were on ground
@@ -247,7 +247,6 @@ class CassieEnv(mjx_env.MjxEnv):
         )
         # jax.debug.print("torques: {}", torques)
 
-        data = state.data
         data = mjx_env.step(
             self._mjx_model, state.data, torques, self.n_substeps
         )
@@ -255,7 +254,8 @@ class CassieEnv(mjx_env.MjxEnv):
         obs = self._get_obs(data)
 
         # Get reward components. `_get_reward` returns ((per_step_raw, event_raw), (lift_given_new, current_both_feet, current_com_error))
-        (per_step_raw, event_raw), (lift_given_new, current_both_feet, current_com_error) = self._get_reward(data, action, state.info)
+        # (per_step_raw, event_raw), (lift_given_new, current_both_feet, current_com_error) = self._get_reward(data, action, state.info)
+        (per_step_raw, event_raw), (current_both_feet, current_com_error) = self._get_reward(data, action, state.info)
 
         # Scale each component by its configured weight
         per_step_scaled = {k: per_step_raw[k] * self._config.reward_config.scales[k] for k in per_step_raw}
@@ -284,7 +284,7 @@ class CassieEnv(mjx_env.MjxEnv):
             "rng": rng,
             "reward_components": {**per_step_scaled, **event_scaled},   # For debugging
             "last_act": action,  # For action rate cost
-            "lift_foot_given": lift_given_new,
+            # "lift_foot_given": lift_given_new,
             # Update tracking info for COM error reduction reward
             "prev_both_feet_contact": current_both_feet,
             "last_both_feet_com_error": last_both_feet_com_error,
@@ -302,6 +302,10 @@ class CassieEnv(mjx_env.MjxEnv):
         # TODO: separate "state" and "privileged state"
         # TODO: We are now using joint angle deltas. Consider changing the action
         #       to represent deltas relative to standing pose as well.
+        # TODO: consider adding foot forces
+        # TODO: consider adding dual history architecture (Z Li). Probably not all
+        #       that useful right now because state is relatively Markovian. But may
+        #       be useful later when noise and external pushes are added.
 
         motor_qpos = data.qpos[QPosIdx.MOTORS]
         motor_qvel = data.qvel[QVelIdx.MOTORS]
@@ -378,15 +382,17 @@ class CassieEnv(mjx_env.MjxEnv):
             "fall": self._cost_fall(data),
         }
 
-        # Compute lift_foot component and updated flag using event logic
-        lift_comp, lift_given_new = self._reward_lift_foot_to_recover(data, info["lift_foot_given"])
-        event["lift_foot"] = lift_comp
+        # # Compute lift_foot component and updated flag using event logic
+        # lift_comp, lift_given_new = self._reward_lift_foot_to_recover(data, info["lift_foot_given"])
+        # event["lift_foot"] = lift_comp
         
         # Compute reduce_com_error component and updated tracking info
         reduce_com_reward, current_both_feet, current_com_error = self._reward_reduce_com_error(data, info)
         event["reduce_com_error"] = reduce_com_reward
 
-        return (per_step, event), (lift_given_new, current_both_feet, current_com_error)
+        # return (per_step, event), (lift_given_new, current_both_feet, current_com_error)
+        return (per_step, event), (current_both_feet, current_com_error)
+
 
     def _reward_lift_foot_to_recover(
             self,
