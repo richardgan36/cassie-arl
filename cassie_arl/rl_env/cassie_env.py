@@ -24,7 +24,7 @@ def default_config() -> config_dict.ConfigDict:
         # --------------------------------
         ctrl_dt=0.02,
         sim_dt=0.002,
-        episode_length=500,  # 10 seconds at ctrl_dt=0.02
+        episode_length=750,  # 15 seconds at ctrl_dt=0.02
         action_repeat=1,
         history_len=1,
 
@@ -67,10 +67,10 @@ def default_config() -> config_dict.ConfigDict:
                 com_outside_support=-0.4,
                 pelvis_lin_vel=-0.2,
                 pelvis_tilt=-0.1,
-                motor_ref_error=-0.2,
+                motor_ref_error=-0.3,
                 airborne=-0.4,
                 # Reward for lifting exactly one foot when COM is far from support
-                lift_foot=0.2,
+                lift_foot=0.0,
                 action_rate=-0.01,
             ),
         ),
@@ -132,6 +132,8 @@ class CassieEnv(mjx_env.MjxEnv):
         self._pelvis_id = self._mj_model.body("cassie-pelvis").id
         self._left_foot_id = self._mj_model.body("left-foot").id
         self._right_foot_id = self._mj_model.body("right-foot").id
+        self._left_tarsus_id = self._mj_model.body("left-tarsus").id
+        self._right_tarsus_id = self._mj_model.body("right-tarsus").id
 
         self._left_foot_gid = geoms_of_body(self._mj_model, self._left_foot_id)
         self._right_foot_gid = geoms_of_body(self._mj_model, self._right_foot_id)
@@ -415,7 +417,7 @@ class CassieEnv(mjx_env.MjxEnv):
     def _cost_fall(self, data: mjx.Data) -> jax.Array:
         """One time cost for falling over."""
         fallen = self._has_fallen(data)
-        # If fallen, return 1.0 as a one-time event cost. The caller will add
+        # If fallen, return 1.0 as a one-time event cost.
         return jnp.where(fallen, 1.0, 0.0)
 
     def _cost_com_outside_support(self, data: mjx.Data) -> jax.Array:
@@ -453,7 +455,7 @@ class CassieEnv(mjx_env.MjxEnv):
         orientation_err = math_utils.angle_diff(rpy[:2], StandingPose.PELVIS_RPY[:2])
 
         # Mean squared error, normalized
-        err_scale = 0.26  # radians (~15 degrees)
+        err_scale = 0.35  # radians (~20 degrees)
         orientation_cost = jnp.mean((orientation_err / err_scale) ** 2)
 
         # Clip to [0,1]
@@ -484,7 +486,6 @@ class CassieEnv(mjx_env.MjxEnv):
 
     def _get_termination(self, data: mjx.Data, step: jax.Array) -> jax.Array:
         """Return True if Cassie has fallen or max timesteps reached."""
-        # TODO: add tarsus hit ground condition
         fallen = self._has_fallen(data)
 
         max_steps = jnp.array(self._config.episode_length, dtype=step.dtype)
@@ -585,9 +586,20 @@ class CassieEnv(mjx_env.MjxEnv):
         return jnp.clip(torques, torque_lb, torque_ub)
     
     def _has_fallen(self, data: mjx.Data) -> jax.Array:
-        """Returns True if Cassie has fallen (pelvis height below threshold)."""
-        pelvis_z = data.qpos[QPosIdx.BASE_HEIGHT].squeeze()
-        return pelvis_z < FALLING_THRESHOLD
+        """Returns True if Cassie has fallen (pelvis height below threshold or tarsus hit ground)."""
+        pelvis_fallen = data.qpos[QPosIdx.BASE_HEIGHT].squeeze() < FALLING_THRESHOLD
+        tarsus_hit = self._tarsus_hit_ground(data)
+        return jnp.logical_or(pelvis_fallen, tarsus_hit)
+
+    def _tarsus_hit_ground(self, data: mjx.Data) -> jax.Array:
+        """Returns True if either tarsus has hit the ground (below threshold)."""
+        left_tarsus_z = data.xpos[self._left_tarsus_id, 2]
+        right_tarsus_z = data.xpos[self._right_tarsus_id, 2]
+        
+        left_hit = left_tarsus_z < TARSUS_HIT_GROUND_THRESHOLD
+        right_hit = right_tarsus_z < TARSUS_HIT_GROUND_THRESHOLD
+        
+        return jnp.logical_or(left_hit, right_hit)
 
     # ---------------- Support polygon & COM helpers ----------------
     def _is_in_contact_with_ground(
