@@ -42,7 +42,7 @@ def default_config() -> config_dict.ConfigDict:
             0.08, 0.08, 0.2, 0.4, 0.08,
             0.08, 0.08, 0.2, 0.0, 0.08
         ]),
-        pd_uncertainty=0.1,  # ±10% uniform randomization of PD gains per episode
+        pd_uncertainty=0.05,  # ±5% uniform randomization of PD gains per episode
         
         # Soft joint limits as a fraction of total joint range
         # (1.0 = full range, 0.0 = no movement allowed)
@@ -71,6 +71,8 @@ def default_config() -> config_dict.ConfigDict:
                 airborne=-1.0,
                 # Reward for lifting exactly one foot when COM is far from support
                 lift_foot=0.0,
+                # Reward for reducing COM error when returning to two-foot support
+                reduce_com_error=0.5,
                 action_rate=-0.01,
             ),
         ),
@@ -191,12 +193,17 @@ class CassieEnv(mjx_env.MjxEnv):
                 "com_outside_support": jnp.zeros(()),
                 "airborne": jnp.zeros(()),
                 "lift_foot": jnp.zeros(()),
+                "reduce_com_error": jnp.zeros(()),
                 "action_rate": jnp.zeros(())
             },
             "action": jnp.zeros((self.action_size,)), 
             "last_act": jnp.zeros((self.action_size,)),
             # Whether the one-time "lift foot" reward has been granted
             "lift_foot_given": jnp.array(False),
+            # Previous foot contact information
+            "prev_both_feet_contact": jnp.array(False),
+            # Last COM error when both feet were on ground
+            "last_both_feet_com_error": jnp.array(0.0),
         }
 
         return mjx_env.State(
@@ -247,8 +254,8 @@ class CassieEnv(mjx_env.MjxEnv):
 
         obs = self._get_obs(data)
 
-        # Get reward components. `_get_reward` returns ((per_step_raw, event_raw), lift_given_new)
-        (per_step_raw, event_raw), lift_given_new = self._get_reward(data, action, state.info)
+        # Get reward components. `_get_reward` returns ((per_step_raw, event_raw), (lift_given_new, current_both_feet, current_com_error))
+        (per_step_raw, event_raw), (lift_given_new, current_both_feet, current_com_error) = self._get_reward(data, action, state.info)
 
         # Scale each component by its configured weight
         per_step_scaled = {k: per_step_raw[k] * self._config.reward_config.scales[k] for k in per_step_raw}
@@ -262,6 +269,14 @@ class CassieEnv(mjx_env.MjxEnv):
         
         done = self._get_termination(data, jnp.array(new_step))
         done = jnp.array(done, dtype=reward.dtype)
+        
+        # Update the last COM error only when both feet are on the ground
+        # This ensures we only store COM error during stable stance phases
+        last_both_feet_com_error = jnp.where(
+            current_both_feet,
+            current_com_error,
+            state.info["last_both_feet_com_error"]
+        )
 
         new_info = {
             **state.info,
@@ -270,6 +285,9 @@ class CassieEnv(mjx_env.MjxEnv):
             "reward_components": {**per_step_scaled, **event_scaled},   # For debugging
             "last_act": action,  # For action rate cost
             "lift_foot_given": lift_given_new,
+            # Update tracking info for COM error reduction reward
+            "prev_both_feet_contact": current_both_feet,
+            "last_both_feet_com_error": last_both_feet_com_error,
         }
         return state.replace(
             data=data,
@@ -325,7 +343,15 @@ class CassieEnv(mjx_env.MjxEnv):
 
         return obs
 
-    def _get_reward(self, data: mjx.Data, action: jax.Array, info: Dict[str, Any]) -> tuple[tuple[dict[str, jax.Array], dict[str, jax.Array]], jax.Array]:
+    def _get_reward(
+            self,
+            data: mjx.Data,
+            action: jax.Array,
+            info: Dict[str, Any]
+        ) -> tuple[
+                tuple[dict[str, jax.Array], dict[str, jax.Array]],
+                tuple[jax.Array, jax.Array, jax.Array]
+            ]:
         """
         Computes reward components.
 
@@ -334,9 +360,7 @@ class CassieEnv(mjx_env.MjxEnv):
         """
         # TODO: IMPORTANT: need to reward active recovery strategies, not just standing still
         # TODO: look into selective/adaptive rewards e.g. lift costs for movement when perturbing robot
-        # TODO: cost for large action rate
         # TODO: cost for large torques
-        # TODO: reward for placing foot down depending on how close COM is to support polygon
 
         # Split components into per-step (integrated over dt) and event (one-time) rewards.
         per_step = {
@@ -357,8 +381,12 @@ class CassieEnv(mjx_env.MjxEnv):
         # Compute lift_foot component and updated flag using event logic
         lift_comp, lift_given_new = self._reward_lift_foot_to_recover(data, info["lift_foot_given"])
         event["lift_foot"] = lift_comp
+        
+        # Compute reduce_com_error component and updated tracking info
+        reduce_com_reward, current_both_feet, current_com_error = self._reward_reduce_com_error(data, info)
+        event["reduce_com_error"] = reduce_com_reward
 
-        return (per_step, event), lift_given_new
+        return (per_step, event), (lift_given_new, current_both_feet, current_com_error)
 
     def _reward_lift_foot_to_recover(
             self,
@@ -483,6 +511,52 @@ class CassieEnv(mjx_env.MjxEnv):
         scaling_factor = 10.0 * self.dt  # Max cost when moving full range in 0.2s
         cost = jnp.sum(jnp.square(act - last_act) / scaling_factor**2) / act.size
         return jnp.clip(cost, 0, 1)
+    
+    def _reward_reduce_com_error(
+            self,
+            data: mjx.Data,
+            info: Dict[str, Any]
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """
+        Reward for reducing the COM error when both feet are on the ground again.
+        
+        Returns:
+            - reward: The quadratically scaled reward for reducing COM error
+            - current_both_feet: Whether both feet are currently on the ground
+            - current_com_error: The current COM error
+        """
+        # Check if both feet are in contact with the ground
+        left_foot_contact = self._is_in_contact_with_ground(data, self._left_foot_gid)
+        right_foot_contact = self._is_in_contact_with_ground(data, self._right_foot_gid)
+        current_both_feet = jnp.logical_and(left_foot_contact, right_foot_contact)
+        
+        # Calculate current COM error (distance from COM to support polygon)
+        vec_to_support = self._vector_com_to_support(data)
+        current_com_error = jnp.linalg.norm(vec_to_support)
+        
+        # Get previous state information
+        prev_both_feet = info["prev_both_feet_contact"]
+        last_com_error = info["last_both_feet_com_error"]
+        
+        # Calculate reward only when transitioning from not-both-feet to both-feet
+        just_landed = jnp.logical_and(current_both_feet, jnp.logical_not(prev_both_feet))
+        
+        # Calculate error reduction (previous - current)
+        error_reduction = last_com_error - current_com_error
+        
+        # Apply quadratic scaling to reward improvement
+        # Positive error_reduction means error is reduced (good)
+        scale_factor = 0.2  # Normalizing constant (m) - max reward when reducing error by this amount
+        reward_raw = (error_reduction / scale_factor)**2
+
+        # Only give reward if there was actual improvement and we just landed
+        reward = jnp.where(
+            jnp.logical_and(just_landed, error_reduction > 0),
+            jnp.clip(reward_raw, 0.0, 1.0),
+            0.0
+        )
+        
+        return reward, current_both_feet, current_com_error
 
     def _get_termination(self, data: mjx.Data, step: jax.Array) -> jax.Array:
         """Return True if Cassie has fallen or max timesteps reached."""
