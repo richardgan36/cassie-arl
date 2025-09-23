@@ -68,7 +68,7 @@ def default_config() -> config_dict.ConfigDict:
                 pelvis_lin_vel=-0.2,
                 pelvis_tilt=-0.1,
                 motor_ref_error=-0.3,
-                airborne=-0.4,
+                airborne=-1.0,
                 # Reward for lifting exactly one foot when COM is far from support
                 lift_foot=0.0,
                 action_rate=-0.01,

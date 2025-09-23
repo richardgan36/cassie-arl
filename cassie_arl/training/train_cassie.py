@@ -36,19 +36,21 @@ network_factory_params = {
     "policy_obs_key": "state",
     "value_hidden_layer_sizes": (512, 256, 128),
     "value_obs_key": "privileged_state",
+    "init_noise_std": 2.0,          # Added to increase exploration
+    "state_dependent_std": True,    # Added to increase exploration
 }
 
 ppo_training_params = {
     'action_repeat': 1,
-    'batch_size': 128,
+    'batch_size': 256,
     'clipping_epsilon': 0.2,
     'discounting': 0.98,  # TODO: Used to be 0.97. Change back?
-    'entropy_cost': 0.005,
+    'entropy_cost': 1e-2,  # Increase initially to encourage exploration
     'episode_length': 512,
-    'learning_rate': 0.0003,
+    'learning_rate': 3e-4,
     'max_grad_norm': 1.0,
     'normalize_observations': True,
-    'num_envs': 2048,
+    'num_envs': 4096,
     'num_evals': 20,
     'num_minibatches': 320,
     'num_resets_per_eval': 1,
@@ -74,14 +76,17 @@ def progress(num_steps: int, metrics: types.Metrics | dict):
     plt.title(f"y={y_data[-1]:.3f}")
     # plt.pause(0.005)  # Small pause to update the figure
 
-    # logging.info(f"steps: {num_steps}, reward: {y_data[-1]:.3f} ± {y_dataerr[-1]:.3f}")
-    # logging.info(f"time since last progress call: {times[-1] - times[-2]}")
+    return
 
     # Save the figure with date (day only, no time)
-    timestamp = datetime.now().strftime("%Y-%m-%d")
-    save_path = script_dir / "progress" / train_id / f"progress_{timestamp}.png"
+    timestamp_day = datetime.now().strftime("%Y-%m-%d")
+    save_path = script_dir / "progress" / train_id / f"progress_{timestamp_day}.png"
     save_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(str(save_path), dpi=150, bbox_inches="tight")
+
+    print("")
+    logging.info("--- Progress update ---")
+    logging.info(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
     if len(times) == 2:
         time_to_jit = times[-1] - times[0]
@@ -92,6 +97,8 @@ def progress(num_steps: int, metrics: types.Metrics | dict):
         last_step = x_data[-2] if len(x_data) >= 2 else None
         logging.info(f"Steps: {num_steps}, Reward: {y_data[-1]:.3f} ± {y_dataerr[-1]:.3f}")
         logging.info(f"Time since last progress call (steps {last_step} -> {num_steps}): {delta}")
+
+    print("-----------------")
 
 
 # def progress(num_steps: int, metrics: types.Metrics | dict):
@@ -241,9 +248,11 @@ def progress(num_steps: int, metrics: types.Metrics | dict):
 
 def visualize_policy(current_step: int, make_policy, params):
     try:
+        print("")
+        logging.info("--- Visualization update ---")
         logging.info(f"Generating rollout video at step {current_step}")
         inference_fn = make_policy(params, deterministic=True)
-        rng = jax.random.PRNGKey(int(current_step) & 0xFFFFFFFF)
+        rng = jax.random.PRNGKey(int(current_step+1) & 0xFFFFFFFF)
         state = jit_reset(rng)
 
         traj = []
@@ -294,6 +303,8 @@ def visualize_policy(current_step: int, make_policy, params):
                 "lift_foot_given": bool(state.info["lift_foot_given"]),
                 "left_foot_z": left_foot_z,
                 "right_foot_z": right_foot_z,
+                "left_tarsus_z": float(np.array(state.data.xpos[env._left_tarsus_id, 2])),
+                "right_tarsus_z": float(np.array(state.data.xpos[env._right_tarsus_id, 2])),
             })
 
         if len(traj) == 0:
@@ -345,6 +356,8 @@ def visualize_policy(current_step: int, make_policy, params):
                 f"Left foot z: {left_foot_z:.3f} m",
                 f"Right foot z: {right_foot_z:.3f} m",
                 f"Lift foot reward given: {lift_foot_given}",
+                f"Left tarsus z: {lift_foot_info['left_tarsus_z']:.3f} m",
+                f"Right tarsus z: {lift_foot_info['right_tarsus_z']:.3f} m",
             ]
             
             # Right side text - reward components
@@ -395,7 +408,7 @@ def visualize_policy(current_step: int, make_policy, params):
 
         # Save video
         fps = float(1.0 / getattr(env, "dt", 0.02))
-        ani_save_dir = script_dir / "simulation" / train_id / "test"
+        ani_save_dir = script_dir / "simulation" / f"{train_id}_3" / "test"
         ani_save_dir.mkdir(parents=True, exist_ok=True)
 
         fig, ax = plt.subplots()
@@ -412,6 +425,8 @@ def visualize_policy(current_step: int, make_policy, params):
         ani.save(ani_save_path, writer="ffmpeg", fps=fps)
         plt.close(fig)
         logging.info(f"Saved rollout video to {ani_save_path}")
+        logging.info(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        logging.info("----------------")
 
     except Exception as e:
         logging.exception(f"Failed to generate/save rollout video at step {current_step}: {e}")
@@ -433,7 +448,7 @@ network_factory = functools.partial(
 )
 
 # # --- Shorten training for testing ---
-ppo_training_params["num_evals"] = 2
+ppo_training_params["num_evals"] = 3
 ppo_training_params["episode_length"] = 5
 ppo_training_params["num_envs"] = 1
 ppo_training_params["num_minibatches"] = 4
@@ -444,8 +459,8 @@ ppo_training_params["num_timesteps"] = 1000
 logging.info("PPO training parameters:")
 logging.info(ppo_training_params)
 
-save_ckpt_dir = script_dir / "checkpoints" / f"{train_id}_2"
-restore_ckpt_path = script_dir / "checkpoints" / f"{train_id}_2" / "000021299200"
+save_ckpt_dir = script_dir / "checkpoints" / f"{train_id}_3"
+restore_ckpt_path = script_dir / "checkpoints" / f"{train_id}_3" / "000068812800"
 
 train_fn = functools.partial(
     ppo.train, **dict(ppo_training_params),
