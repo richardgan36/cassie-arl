@@ -1,0 +1,109 @@
+# Python built-in packages
+from datetime import datetime
+import functools
+from pathlib import Path
+
+# Third-party packages
+from brax.training.agents.ppo import networks as ppo_networks
+from brax.training.agents.ppo import train as ppo
+import jax
+from absl import logging
+from mujoco_playground import wrapper
+
+from cassie_arl.rl_env.cassie_env import CassieEnv
+from cassie_arl.rl_env.cassie_domain_randomizer import domain_randomize
+from cassie_arl.training.ppo_callbacks import ProgressCallback, VisualizePolicyCallback
+
+
+script_dir = Path(__file__).parent.resolve()
+logging.set_verbosity(logging.INFO)
+
+network_factory_params = {
+    "policy_hidden_layer_sizes": (512, 256, 128),
+    "policy_obs_key": "state",
+    "value_hidden_layer_sizes": (512, 256, 128),
+    "value_obs_key": "privileged_state",
+    "init_noise_std": 2.0,          # Added to increase exploration
+    "state_dependent_std": True,    # Added to increase exploration
+}
+
+ppo_training_params = {
+    'action_repeat': 1,
+    'batch_size': 256,
+    'clipping_epsilon': 0.2,
+    'discounting': 0.98,  # TODO: Used to be 0.97. Change back?
+    'entropy_cost': 1e-2,  # Increase initially to encourage exploration
+    'episode_length': 512,
+    'learning_rate': 1e-3,  # Was 3e-4
+    'max_grad_norm': 1.0,
+    'normalize_observations': True,
+    'num_envs': 4096,
+    'num_evals': 20,
+    'num_minibatches': 320,
+    'num_resets_per_eval': 1,
+    'num_timesteps': 200_000_000,
+    'num_updates_per_batch': 4,
+    'reward_scaling': 2.0,
+    'unroll_length': 20,
+    'restore_value_fn': True,
+}
+
+train_id = "cassie_obs38"  # Observation space is 38D
+env = CassieEnv()
+
+# JIT-wrapped env functions kept as local variables and passed into the visualization callback
+jit_step = jax.jit(env.step)
+jit_reset = jax.jit(env.reset)
+
+# randomizer = domain_randomize
+randomizer = None
+
+network_factory = functools.partial(
+    ppo_networks.make_ppo_networks,
+    **dict(network_factory_params)
+)
+
+# # --- Shorten training for testing ---
+ppo_training_params["num_evals"] = 3
+ppo_training_params["episode_length"] = 5
+ppo_training_params["num_envs"] = 1
+ppo_training_params["num_minibatches"] = 4
+ppo_training_params["batch_size"] = 2
+ppo_training_params["unroll_length"] = 8
+ppo_training_params["num_timesteps"] = 1002
+
+logging.info("PPO training parameters:")
+logging.info(ppo_training_params)
+
+save_ckpt_dir = script_dir / "checkpoints" / f"{train_id}_3"
+restore_ckpt_path = script_dir / "checkpoints" / f"{train_id}_3" / "000068812800"
+
+# Instantiate callback objects
+progress_cb = ProgressCallback(ppo_training_params, script_dir, train_id, save_plot=False)
+viz_cb = VisualizePolicyCallback(env, jit_reset, jit_step, script_dir, train_id)
+
+train_fn = functools.partial(
+    ppo.train, **dict(ppo_training_params),
+    network_factory=network_factory,
+    randomization_fn=randomizer,
+    progress_fn=progress_cb,
+    policy_params_fn=viz_cb,
+    # save_checkpoint_path=str(save_ckpt_dir),
+    restore_checkpoint_path=str(restore_ckpt_path)
+)
+
+if "save_checkpoint_path" in train_fn.keywords:
+    logging.info(f"Checkpoints will be saved to {train_fn.keywords['save_checkpoint_path']}")
+
+# Start training
+make_inference_fn, params, metrics = train_fn(
+    environment=env,
+    eval_env=CassieEnv(),
+    wrap_env_fn=wrapper.wrap_for_brax_training,
+)
+
+if hasattr(progress_cb, "times") and len(progress_cb.times) >= 2:
+    logging.info(f"time to train: {progress_cb.times[-1] - progress_cb.times[1]}")
+else:
+    logging.info("time to train: not enough progress timestamps available")
+
