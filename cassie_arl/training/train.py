@@ -64,22 +64,22 @@ network_factory = functools.partial(
 )
 
 # # --- Shorten training for testing ---
-ppo_training_params["num_evals"] = 3
-ppo_training_params["episode_length"] = 5
-ppo_training_params["num_envs"] = 1
-ppo_training_params["num_minibatches"] = 4
-ppo_training_params["batch_size"] = 2
-ppo_training_params["unroll_length"] = 8
-ppo_training_params["num_timesteps"] = 1002
+# ppo_training_params["num_evals"] = 3
+# ppo_training_params["episode_length"] = 5
+# ppo_training_params["num_envs"] = 1
+# ppo_training_params["num_minibatches"] = 4
+# ppo_training_params["batch_size"] = 2
+# ppo_training_params["unroll_length"] = 8
+# ppo_training_params["num_timesteps"] = 1002
 
 logging.info("PPO training parameters:")
 logging.info(ppo_training_params)
 
-save_ckpt_dir = script_dir / "checkpoints" / f"{train_id}_3"
-restore_ckpt_path = script_dir / "checkpoints" / f"{train_id}_3" / "000068812800"
+save_ckpt_dir = script_dir / "checkpoints" / f"{train_id}_4"
+restore_ckpt_path = script_dir / "checkpoints" / f"{train_id}_4" / "000003276800"
 
 # Instantiate callback objects
-progress_cb = ProgressCallback(ppo_training_params, script_dir, train_id, save_plot=False)
+progress_cb = ProgressCallback(ppo_training_params, script_dir, train_id, save_plot=True)
 viz_cb = VisualizePolicyCallback(env, jit_reset, jit_step, script_dir, train_id)
 
 train_fn = functools.partial(
@@ -88,8 +88,8 @@ train_fn = functools.partial(
     randomization_fn=randomizer,
     progress_fn=progress_cb,
     policy_params_fn=viz_cb,
-    # save_checkpoint_path=str(save_ckpt_dir),
-    restore_checkpoint_path=str(restore_ckpt_path)
+    save_checkpoint_path=str(save_ckpt_dir),
+    restore_checkpoint_path=restore_ckpt_path.as_posix()
 )
 
 if "save_checkpoint_path" in train_fn.keywords:

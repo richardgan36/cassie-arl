@@ -72,7 +72,7 @@ def default_config() -> config_dict.ConfigDict:
                 # Reward for lifting exactly one foot when COM is far from support
                 lift_foot=0.0,
                 # Reward for reducing COM error when returning to two-foot support
-                reduce_com_error=0.5,
+                reduce_com_error=1.0,
                 action_rate=-0.01,
             ),
         ),

@@ -1,7 +1,8 @@
 """Callback functions passed into PPO training loop."""
 from absl import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
+import time
 
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
@@ -73,8 +74,6 @@ class ProgressCallback:
         plt.savefig(str(save_path), dpi=150, bbox_inches="tight")
 
 
-
-
 class VisualizePolicyCallback:
     """Callable visualization callback for Brax PPO training loop."""
     def __init__(self, env, jit_reset, jit_step, script_dir: Path, train_id: str):
@@ -86,6 +85,7 @@ class VisualizePolicyCallback:
 
     def __call__(self, current_step: int, make_policy, params):
         try:
+            start_time = time.time()
             print("")
             logging.info("--- Visualization update ---")
             logging.info(f"Generating rollout video at step {current_step}")
@@ -138,7 +138,7 @@ class VisualizePolicyCallback:
                 left_foot_z = float(np.array(state.data.xpos[self.env._left_foot_id, 2])) - FOOT_OFFSET
                 right_foot_z = float(np.array(state.data.xpos[self.env._right_foot_id, 2])) - FOOT_OFFSET
                 lift_foot_info_list.append({
-                    "lift_foot_given": bool(state.info["lift_foot_given"]),
+                    # "lift_foot_given": bool(state.info["lift_foot_given"]),
                     "left_foot_z": left_foot_z,
                     "right_foot_z": right_foot_z,
                     "left_tarsus_z": float(np.array(state.data.xpos[self.env._left_tarsus_id, 2])),
@@ -177,7 +177,7 @@ class VisualizePolicyCallback:
                 lift_foot_info = lift_foot_info_list[f_idx]
                 left_foot_z = lift_foot_info['left_foot_z']
                 right_foot_z = lift_foot_info['right_foot_z']
-                lift_foot_given = lift_foot_info['lift_foot_given']
+                # lift_foot_given = lift_foot_info['lift_foot_given']
                 
                 # Reward info
                 reward_info = reward_info_list[f_idx]
@@ -193,7 +193,7 @@ class VisualizePolicyCallback:
                     f"L contact: {com_info['left_contact']}, R contact: {com_info['right_contact']}",
                     f"Left foot z: {left_foot_z:.3f} m",
                     f"Right foot z: {right_foot_z:.3f} m",
-                    f"Lift foot reward given: {lift_foot_given}",
+                    # f"Lift foot reward given: {lift_foot_given}",
                     f"Left tarsus z: {lift_foot_info['left_tarsus_z']:.3f} m",
                     f"Right tarsus z: {lift_foot_info['right_tarsus_z']:.3f} m",
                 ]
@@ -246,7 +246,7 @@ class VisualizePolicyCallback:
 
             # Save video
             fps = float(1.0 / getattr(self.env, "dt", 0.02))
-            ani_save_dir = self.script_dir / "simulation" / f"{self.train_id}_3" / "test"
+            ani_save_dir = self.script_dir / "simulation" / f"{self.train_id}_4"
             ani_save_dir.mkdir(parents=True, exist_ok=True)
 
             fig, ax = plt.subplots()
@@ -262,8 +262,12 @@ class VisualizePolicyCallback:
             ani_save_path = ani_save_dir / f"rollout_step{current_step}-{timestamp}.mp4"
             ani.save(ani_save_path, writer="ffmpeg", fps=fps)
             plt.close(fig)
+
+            end_time = time.time()
+            duration = timedelta(seconds=end_time - start_time)
             logging.info(f"Saved rollout video to {ani_save_path}")
             logging.info(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            logging.info(f"Duration of visualization update: {duration}")
             logging.info("----------------")
 
         except Exception as e:
