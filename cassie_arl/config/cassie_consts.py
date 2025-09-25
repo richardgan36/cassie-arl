@@ -23,6 +23,18 @@ class StandingPose:
         -1.21,      # Right knee
         -1.643,     # Right foot
     ])
+    MOTOR_TORQUES: jax.Array = jnp.array([  # TODO: replace with actual values
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+    ])
 
 
 @dataclass(frozen=True)

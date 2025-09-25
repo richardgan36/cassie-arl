@@ -56,13 +56,13 @@ def default_config() -> config_dict.ConfigDict:
             ),
         ),
         reset_noise_config=config_dict.create(
-            level=1.0,  # Set to 0.0 to disable noise.
+            level=0.0,  # Set to 0.0 to disable noise.
             scales=config_dict.create(  # TODO: define scale of noise for reset
                 xy=jnp.array([-0.5, 0.5]),      # Additive
                 z=jnp.array([0, 0.1]),          # Additive
                 yaw=jnp.array([-3.14, 3.14]),   # Set absolute
-                motors=jnp.array([-0.1, 0.1]),  # Multiplicative: Motors *= U(1-0.1, 1+0.1)
-                dxyz=jnp.array([-0.5, 0.5]),    # Additive
+                motors=jnp.array([-0.05, 0.05]),  # Multiplicative: Motors *= U(1-0.05, 1+0.05)
+                dxyz=jnp.array([-0.2, 0.2]),    # Additive
                 drpy=jnp.array([-0.2, 0.2]),    # Additive
             ),
         ),
@@ -525,13 +525,16 @@ class CassieEnv(mjx_env.MjxEnv):
         """
         Scales normalized actions [-1, 1] to actual motor joint angles.
 
-        The action is interpreted as a normalized position target for each
-        of the 10 actuated joints.
+        The action is interpreted as normalized deltas of the 10 actuated
+        joints from the standing pose angles. The scaling consists of a
+        piecewise linear mapping:
+            [-1, 0] -> [soft lower limit, standing pose]
+            [ 0, 1] -> [standing pose, soft upper limit]
         """
-        return self._jnt_soft_lowers + (action + 1) / 2.0 * (
-            self._jnt_soft_uppers - self._jnt_soft_lowers
-        )
-    
+        s_pos = self._jnt_soft_uppers - StandingPose.MOTOR_ANGLES   # Positive side span
+        s_neg = StandingPose.MOTOR_ANGLES - self._jnt_soft_lowers   # Negative side span
+        return StandingPose.MOTOR_ANGLES + 0.5*(s_pos + s_neg)*action + 0.5*(s_pos - s_neg)*jnp.abs(action)
+
     def _pd_control(
             self,
             data: mjx.Data,
@@ -550,8 +553,7 @@ class CassieEnv(mjx_env.MjxEnv):
         pos_err = pos_targets - motor_qpos
         vel_err = -motor_qvel  # Target vel is zero
 
-        torques = p_gain * pos_err + d_gain * vel_err
-
+        torques = p_gain * pos_err + d_gain * vel_err + StandingPose.MOTOR_TORQUES
         return jnp.clip(torques, torque_lb, torque_ub)
     
     def _has_fallen(self, data: mjx.Data) -> jax.Array:
