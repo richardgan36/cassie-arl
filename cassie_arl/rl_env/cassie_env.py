@@ -1,3 +1,4 @@
+import os
 from typing import Any, Dict, Optional, Union
 from pathlib import Path
 
@@ -50,7 +51,7 @@ def default_config() -> config_dict.ConfigDict:
             0.5, 0.8, 0.95, 0.95, 0.95   # R_HIP_ROLL, R_HIP_YAW, R_HIP_PITCH, R_KNEE, R_FOOT
         ]),
         obs_noise_config=config_dict.create(
-            level=1.0,  # Set to 0.0 to disable noise.
+            level=0.0,  # Set to 0.0 to disable noise.
             scales=config_dict.create(  # TODO: define scale of noise for observations
                 gyro=0.2,  # Not used
             ),
@@ -77,7 +78,7 @@ def default_config() -> config_dict.ConfigDict:
                 com_outside_support=-0.3,
                 pelvis_lin_vel=-0.2,
                 pelvis_tilt=-0.2,
-                motor_ref_error=-0.3,
+                motor_ref_error=-0.4,
             ),
         ),
         # Parameters for the "lift foot" reward
@@ -86,7 +87,6 @@ def default_config() -> config_dict.ConfigDict:
         # `lift_foot_clearance` (m) clearance from the ground, the
         # environment returns a binary reward (1.0) for that component.
         com_outside_support_threshold=0.06,     # meters
-        lift_foot_clearance=0.025,              # meters
     )
 
 
@@ -232,19 +232,7 @@ class CassieEnv(mjx_env.MjxEnv):
         rng = state.info["rng"]
         rng, key = jax.random.split(rng)
 
-        pos_targets = self._action_norm2actual(action)
-
-        p_gain = state.info["p_gain"]
-        d_gain = state.info["d_gain"]
-
-        torques = self._pd_control(
-            state.data,
-            pos_targets,
-            p_gain,
-            d_gain,
-            self._torque_lowers,
-            self._torque_uppers
-        )
+        torques = self._action_norm2torque(action)
 
         data = mjx_env.step(
             self._mjx_model, state.data, torques, self.n_substeps
@@ -521,19 +509,18 @@ class CassieEnv(mjx_env.MjxEnv):
         )
         return rng, p_gain, d_gain
 
-    def _action_norm2actual(self, action: jax.Array) -> jax.Array:
+    def _action_norm2torque(
+            self,
+            action: jax.Array,
+            torque_lb: jax.Array,
+            torque_ub: jax.Array,
+        ) -> jax.Array:
         """
-        Scales normalized actions [-1, 1] to actual motor joint angles.
+        Converts normalized action in [-1, 1] to torques.
+        """
 
-        The action is interpreted as normalized deltas of the 10 actuated
-        joints from the standing pose angles. The scaling consists of a
-        piecewise linear mapping:
-            [-1, 0] -> [soft lower limit, standing pose]
-            [ 0, 1] -> [standing pose, soft upper limit]
-        """
-        s_pos = self._jnt_soft_uppers - StandingPose.MOTOR_ANGLES   # Positive side span
-        s_neg = StandingPose.MOTOR_ANGLES - self._jnt_soft_lowers   # Negative side span
-        return StandingPose.MOTOR_ANGLES + 0.5*(s_pos + s_neg)*action + 0.5*(s_pos - s_neg)*jnp.abs(action)
+        # Scale action to torque range
+        return torque_lb + 0.5 * (torque_ub - torque_lb) * (action + 1)
 
     def _pd_control(
             self,
