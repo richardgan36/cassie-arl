@@ -5,7 +5,6 @@ import jax
 import jax.numpy as jnp
 import mujoco as mj
 import mujoco.mjx as mjx
-from absl import logging
 from ml_collections import config_dict
 from mujoco_playground._src import mjx_env
 
@@ -42,7 +41,7 @@ def default_config() -> config_dict.ConfigDict:
             0.08, 0.08, 0.2, 0.4, 0.08,
             0.08, 0.08, 0.2, 0.0, 0.08
         ]),
-        pd_uncertainty=0.05,  # ±5% uniform randomization of PD gains per episode
+        pd_uncertainty=0.00,  # ±0% uniform randomization of PD gains per episode
         
         # Soft joint limits as a fraction of total joint range
         # (1.0 = full range, 0.0 = no movement allowed)
@@ -50,10 +49,21 @@ def default_config() -> config_dict.ConfigDict:
             0.5, 0.8, 0.95, 0.95, 0.95,  # L_HIP_ROLL, L_HIP_YAW, L_HIP_PITCH, L_KNEE, L_FOOT
             0.5, 0.8, 0.95, 0.95, 0.95   # R_HIP_ROLL, R_HIP_YAW, R_HIP_PITCH, R_KNEE, R_FOOT
         ]),
-        noise_config=config_dict.create(
+        obs_noise_config=config_dict.create(
             level=1.0,  # Set to 0.0 to disable noise.
-            scales=config_dict.create(  # TODO: define scale of noise for each joint
-                gyro=0.2,  # angvel.
+            scales=config_dict.create(  # TODO: define scale of noise for observations
+                gyro=0.2,  # Not used
+            ),
+        ),
+        reset_noise_config=config_dict.create(
+            level=1.0,  # Set to 0.0 to disable noise.
+            scales=config_dict.create(  # TODO: define scale of noise for reset
+                xy=jnp.array([-0.5, 0.5]),      # Additive
+                z=jnp.array([0, 0.1]),          # Additive
+                yaw=jnp.array([-3.14, 3.14]),   # Set absolute
+                motors=jnp.array([-0.1, 0.1]),  # Multiplicative: Motors *= U(1-0.1, 1+0.1)
+                dxyz=jnp.array([-0.5, 0.5]),    # Additive
+                drpy=jnp.array([-0.2, 0.2]),    # Additive
             ),
         ),
 
@@ -64,16 +74,10 @@ def default_config() -> config_dict.ConfigDict:
             scales=config_dict.create(
                 alive=2.0,
                 fall=-8.0,
-                com_outside_support=-0.4,
+                com_outside_support=-0.3,
                 pelvis_lin_vel=-0.2,
                 pelvis_tilt=-0.2,
                 motor_ref_error=-0.3,
-                airborne=-1.0,
-                # Reward for lifting exactly one foot when COM is far from support
-                lift_foot=0.0,
-                # Reward for reducing COM error when returning to two-foot support
-                reduce_com_error=1.0,
-                action_rate=-0.01,
             ),
         ),
         # Parameters for the "lift foot" reward
@@ -228,11 +232,7 @@ class CassieEnv(mjx_env.MjxEnv):
         rng = state.info["rng"]
         rng, key = jax.random.split(rng)
 
-        # jax.debug.print("action: {}", action)
-
         pos_targets = self._action_norm2actual(action)
-
-        # jax.debug.print("pos_targets: {}", pos_targets)
 
         p_gain = state.info["p_gain"]
         d_gain = state.info["d_gain"]
@@ -245,7 +245,6 @@ class CassieEnv(mjx_env.MjxEnv):
             self._torque_lowers,
             self._torque_uppers
         )
-        # jax.debug.print("torques: {}", torques)
 
         data = mjx_env.step(
             self._mjx_model, state.data, torques, self.n_substeps
@@ -255,7 +254,7 @@ class CassieEnv(mjx_env.MjxEnv):
 
         # Get reward components. `_get_reward` returns ((per_step_raw, event_raw), (lift_given_new, current_both_feet, current_com_error))
         # (per_step_raw, event_raw), (lift_given_new, current_both_feet, current_com_error) = self._get_reward(data, action, state.info)
-        (per_step_raw, event_raw), (current_both_feet, current_com_error) = self._get_reward(data, action, state.info)
+        (per_step_raw, event_raw) = self._get_reward(data, action, state.info)
 
         # Scale each component by its configured weight
         per_step_scaled = {k: per_step_raw[k] * self._config.reward_config.scales[k] for k in per_step_raw}
@@ -269,14 +268,6 @@ class CassieEnv(mjx_env.MjxEnv):
         
         done = self._get_termination(data, jnp.array(new_step))
         done = jnp.array(done, dtype=reward.dtype)
-        
-        # Update the last COM error only when both feet are on the ground
-        # This ensures we only store COM error during stable stance phases
-        last_both_feet_com_error = jnp.where(
-            current_both_feet,
-            current_com_error,
-            state.info["last_both_feet_com_error"]
-        )
 
         new_info = {
             **state.info,
@@ -284,10 +275,6 @@ class CassieEnv(mjx_env.MjxEnv):
             "rng": rng,
             "reward_components": {**per_step_scaled, **event_scaled},   # For debugging
             "last_act": action,  # For action rate cost
-            # "lift_foot_given": lift_given_new,
-            # Update tracking info for COM error reduction reward
-            "prev_both_feet_contact": current_both_feet,
-            "last_both_feet_com_error": last_both_feet_com_error,
         }
         return state.replace(
             data=data,
@@ -313,7 +300,6 @@ class CassieEnv(mjx_env.MjxEnv):
 
         # Add pelvis orientation as a flat quaternion
         pelvis_quat = data.qpos[QPosIdx.BASE_QUAT]
-        gravity_in_pelvis_frame = math_utils.gravity_in_base_frame(pelvis_quat)
 
         # Pelvis height (z coord of root)
         pelvis_height = data.qpos[QPosIdx.BASE_HEIGHT]  # shape (1,)
@@ -328,21 +314,15 @@ class CassieEnv(mjx_env.MjxEnv):
         right_contact_f = jnp.where(right_contact, 1.0, 0.0)
         foot_contact = jnp.array([left_contact_f, right_contact_f])
 
-        # Vector from COM to closest point on support polygon (XY)
-        com_to_support_world = self._vector_com_to_support(data)
-        com_to_support_pelvis = math_utils.vec_xy_world_to_base(com_to_support_world, pelvis_quat)
-
         # Concatenate into a single vector. Order chosen to keep base-state first,
         # then motor errors and velocities, then pelvis vel, then foot contact and com->support.
         obs = jnp.concatenate([
             pelvis_height,
             pelvis_quat,
-            gravity_in_pelvis_frame,
             motor_qpos_delta,
-            motor_qvel,
             pelvis_qvel,
-            foot_contact,
-            com_to_support_pelvis,
+            motor_qvel,
+            foot_contact
         ])
 
         return obs
@@ -382,67 +362,7 @@ class CassieEnv(mjx_env.MjxEnv):
             "fall": self._cost_fall(data),
         }
 
-        # # Compute lift_foot component and updated flag using event logic
-        # lift_comp, lift_given_new = self._reward_lift_foot_to_recover(data, info["lift_foot_given"])
-        # event["lift_foot"] = lift_comp
-        
-        # Compute reduce_com_error component and updated tracking info
-        reduce_com_reward, current_both_feet, current_com_error = self._reward_reduce_com_error(data, info)
-        event["reduce_com_error"] = reduce_com_reward
-
-        # return (per_step, event), (lift_given_new, current_both_feet, current_com_error)
-        return (per_step, event), (current_both_feet, current_com_error)
-
-
-    def _reward_lift_foot_to_recover(
-            self,
-            data: mjx.Data,
-            lift_foot_given: jax.Array
-        ) -> tuple[jax.Array, jax.Array]:
-        """
-        Reward 1.0 when COM is 'outside' the support polygon and
-        exactly one foot is lifted by at least `lift_foot_clearance`.
-
-        This encourages active recovery strategies (lifting one foot to reach
-        or step) instead of keeping both feet planted and falling.
-        Cassie is considered 'outside' the support polygon if the distance
-        from the COM to the support polygon is greater than a threshold.
-
-        Args:
-            lift_foot_given: Boolean flag indicating whether the one-time
-                reward has already been given for the current "COM outside"
-                event. If True, no further reward is given until the COM
-                returns inside the support polygon and then goes outside again.
-        """
-        # Distance vector from COM to support (2D)
-        vec = self._vector_com_to_support(data)
-        dist = jnp.linalg.norm(vec)
-
-        # Check COM beyond threshold
-        com_outside_support = dist >= self._config.com_outside_support_threshold
-
-        # Foot clearances using body z positions (world frame)
-        left_z = jnp.array(data.xpos[self._left_foot_id, 2]) - FOOT_OFFSET
-        right_z = jnp.array(data.xpos[self._right_foot_id, 2]) - FOOT_OFFSET
-
-        left_lifted = left_z >= self._config.lift_foot_clearance
-        right_lifted = right_z >= self._config.lift_foot_clearance
-
-        # Exactly one foot lifted
-        exactly_one = jnp.logical_xor(left_lifted, right_lifted)
-
-        # Should we give reward now? Event active (COM outside), not given yet for
-        # this active period, and exactly one foot lifted.
-        give_now = jnp.logical_and(jnp.logical_and(com_outside_support, jnp.logical_not(lift_foot_given)), exactly_one)
-
-        # Raw component: if giving now, return 1.0 as a one-time event reward.
-        cost = jnp.where(give_now, 1.0, 0.0)
-
-        # Update flag: if COM is outside, keep previous or set flag if we just gave the reward.
-        # If COM is inside, reset the flag so future outside-events can be rewarded
-        lift_given_new = jnp.where(com_outside_support, jnp.logical_or(lift_foot_given, give_now), jnp.array(False))
-
-        return cost, lift_given_new
+        return (per_step, event)
 
     def _reward_alive(self) -> jax.Array:
         """Reward for staying 'alive' (not falling over)."""
@@ -502,67 +422,6 @@ class CassieEnv(mjx_env.MjxEnv):
         err_scale = 0.35  # Normalizing constant (radians)
         cost = jnp.mean((err / err_scale)**2)
         return jnp.clip(cost, 0, 1)
-    
-    def _cost_airborne(self, data: mjx.Data) -> jax.Array:
-        """Cost for having both feet off the ground."""
-        left_foot_contact = self._is_in_contact_with_ground(data, self._left_foot_gid)
-        right_foot_contact = self._is_in_contact_with_ground(data, self._right_foot_gid)
-
-        airborne = jnp.logical_and(jnp.logical_not(left_foot_contact), jnp.logical_not(right_foot_contact))
-        return jnp.where(airborne, 1.0, 0.0)
-    
-    def _cost_action_rate(self, act: jax.Array, last_act: jax.Array) -> jax.Array:
-        """Cost for large changes in action between steps."""
-        # Action is [-1, 1], which maps to the full range of motor motion.
-        scaling_factor = 10.0 * self.dt  # Max cost when moving full range in 0.2s
-        cost = jnp.sum(jnp.square(act - last_act) / scaling_factor**2) / act.size
-        return jnp.clip(cost, 0, 1)
-    
-    def _reward_reduce_com_error(
-            self,
-            data: mjx.Data,
-            info: Dict[str, Any]
-    ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        """
-        Reward for reducing the COM error when both feet are on the ground again.
-        
-        Returns:
-            - reward: The quadratically scaled reward for reducing COM error
-            - current_both_feet: Whether both feet are currently on the ground
-            - current_com_error: The current COM error
-        """
-        # Check if both feet are in contact with the ground
-        left_foot_contact = self._is_in_contact_with_ground(data, self._left_foot_gid)
-        right_foot_contact = self._is_in_contact_with_ground(data, self._right_foot_gid)
-        current_both_feet = jnp.logical_and(left_foot_contact, right_foot_contact)
-        
-        # Calculate current COM error (distance from COM to support polygon)
-        vec_to_support = self._vector_com_to_support(data)
-        current_com_error = jnp.linalg.norm(vec_to_support)
-        
-        # Get previous state information
-        prev_both_feet = info["prev_both_feet_contact"]
-        last_com_error = info["last_both_feet_com_error"]
-        
-        # Calculate reward only when transitioning from not-both-feet to both-feet
-        just_landed = jnp.logical_and(current_both_feet, jnp.logical_not(prev_both_feet))
-        
-        # Calculate error reduction (previous - current)
-        error_reduction = last_com_error - current_com_error
-        
-        # Apply quadratic scaling to reward improvement
-        # Positive error_reduction means error is reduced (good)
-        scale_factor = 0.2  # Normalizing constant (m) - max reward when reducing error by this amount
-        reward_raw = (error_reduction / scale_factor)**2
-
-        # Only give reward if there was actual improvement and we just landed
-        reward = jnp.where(
-            jnp.logical_and(just_landed, error_reduction > 0),
-            jnp.clip(reward_raw, 0.0, 1.0),
-            0.0
-        )
-        
-        return reward, current_both_feet, current_com_error
 
     def _get_termination(self, data: mjx.Data, step: jax.Array) -> jax.Array:
         """Return True if Cassie has fallen or max timesteps reached."""
@@ -578,31 +437,64 @@ class CassieEnv(mjx_env.MjxEnv):
             self, rng: jax.Array, qpos: jax.Array, qvel: jax.Array
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         """Add uniform random perturbations to base and motor positions/velocities."""
-        # x=+U(-0.5, 0.5), y=+U(-0.5, 0.5), z=+U(0, 0.1), yaw=U(-3.14, 3.14).
         rng, key = jax.random.split(rng)
-        dxy = jax.random.uniform(key, (2,), minval=-0.5, maxval=0.5)
-
-        rng, key = jax.random.split(rng)
-        dz = jax.random.uniform(key, (1,), minval=0.0, maxval=0.1)
-
-        rng, key = jax.random.split(rng)
-        yaw = jax.random.uniform(key, (1,), minval=-3.14, maxval=3.14)
-        quat = math_utils.euler2quat(jnp.array([0.0, 0.0, yaw[0]]))
-
-        qpos = qpos.at[QPosIdx.BASE_XY].add(dxy)
-        qpos = qpos.at[QPosIdx.BASE_HEIGHT].add(dz)
-        qpos = qpos.at[QPosIdx.BASE_QUAT].set(quat)
-
-        # qpos[MOTORS]=*U(0.8, 1.2)
-        rng, key = jax.random.split(rng)
-        qpos = qpos.at[QPosIdx.MOTORS].set(
-            qpos[QPosIdx.MOTORS] * jax.random.uniform(key, (10,), minval=0.9, maxval=1.1)
+        qpos = qpos.at[QPosIdx.BASE_XY].add(
+            jax.random.uniform(
+                key,
+                (2,),
+                minval=self._config.reset_noise_config.scales.xy[0] * self._config.reset_noise_config.level,
+                maxval=self._config.reset_noise_config.scales.xy[1] * self._config.reset_noise_config.level
+            )
         )
 
-        # d(xyzrpy)=U(-0.5, 0.5)
         rng, key = jax.random.split(rng)
+        qpos = qpos.at[QPosIdx.BASE_HEIGHT].add(
+            jax.random.uniform(
+                key,
+                (1,),
+                minval=self._config.reset_noise_config.scales.z[0] * self._config.reset_noise_config.level,
+                maxval=self._config.reset_noise_config.scales.z[1] * self._config.reset_noise_config.level
+            )
+        )
+
+        rng, key = jax.random.split(rng)
+        yaw = jax.random.uniform(
+            key,
+            (1,),
+            minval=self._config.reset_noise_config.scales.yaw[0] * self._config.reset_noise_config.level,
+            maxval=self._config.reset_noise_config.scales.yaw[1] * self._config.reset_noise_config.level
+        )
+        quat = math_utils.euler2quat(jnp.array([0.0, 0.0, yaw[0]]))
+        qpos = qpos.at[QPosIdx.BASE_QUAT].set(quat)
+
+        # Noise is multiplicative on motor angles
+        rng, key = jax.random.split(rng)
+        qpos = qpos.at[QPosIdx.MOTORS].multiply(
+            jax.random.uniform(
+                key,
+                (10,),
+                minval=1 - self._config.reset_noise_config.scales.motors[0] * self._config.reset_noise_config.level,
+                maxval=1 + self._config.reset_noise_config.scales.motors[1] * self._config.reset_noise_config.level
+            )
+        )
+
+        rng, key = jax.random.split(rng)
+        dxyz_delta = jax.random.uniform(
+            key, 
+            (3,),
+            minval=self._config.reset_noise_config.scales.dxyz[0] * self._config.reset_noise_config.level,
+            maxval=self._config.reset_noise_config.scales.dxyz[1] * self._config.reset_noise_config.level
+        )
+        rng, key = jax.random.split(rng)
+        drpy_delta = jax.random.uniform(
+            key,
+            (3,),
+            minval=self._config.reset_noise_config.scales.drpy[0] * self._config.reset_noise_config.level,
+            maxval=self._config.reset_noise_config.scales.drpy[1] * self._config.reset_noise_config.level
+        )
+
         qvel = qvel.at[QVelIdx.BASE].add(
-            jax.random.uniform(key, (6,), minval=-0.2, maxval=0.2)
+            jnp.concatenate([dxyz_delta, drpy_delta])
         )
 
         return rng, qpos, qvel
@@ -657,9 +549,6 @@ class CassieEnv(mjx_env.MjxEnv):
         # PD control
         pos_err = pos_targets - motor_qpos
         vel_err = -motor_qvel  # Target vel is zero
-
-        # jax.debug.print("pos_err: {}", pos_err)
-        # jax.debug.print("vel_err: {}", vel_err)
 
         torques = p_gain * pos_err + d_gain * vel_err
 
