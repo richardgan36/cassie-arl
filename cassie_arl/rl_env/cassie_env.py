@@ -22,9 +22,9 @@ def default_config() -> config_dict.ConfigDict:
         # --------------------------------
         # Required simulation parameters
         # --------------------------------
-        ctrl_dt=0.02,
-        sim_dt=0.002,
-        episode_length=750,  # 15 seconds at ctrl_dt=0.02
+        ctrl_dt=0.01,
+        sim_dt=0.0005,  # Match "timestep" in MJCF
+        episode_length=1000,  # 10 seconds at ctrl_dt=0.01
         action_repeat=1,
         history_len=1,
 
@@ -73,12 +73,12 @@ def default_config() -> config_dict.ConfigDict:
         # are in [0, 1] and all cost weights are in [-1, 0].
         reward_config=config_dict.create(
             scales=config_dict.create(
-                alive=2.0,
-                fall=-8.0,
-                com_outside_support=-0.3,
-                pelvis_lin_vel=-0.2,
-                pelvis_tilt=-0.2,
-                motor_ref_error=-0.4,
+                alive=1.0,
+                fall=-5.0,
+                com_outside_support=-0.2,
+                pelvis_lin_vel=-0.4,
+                pelvis_tilt=-0.4,
+                motor_ref_error=-0.7,
             ),
         ),
         # Parameters for the "lift foot" reward
@@ -186,8 +186,6 @@ class CassieEnv(mjx_env.MjxEnv):
         info = {
             "rng": rng,
             "step": 0,
-            "p_gain": p_gain,
-            "d_gain": d_gain,
             "reward_components": {
                 "alive": jnp.zeros(()),
                 "fall": jnp.zeros(()),
@@ -195,19 +193,12 @@ class CassieEnv(mjx_env.MjxEnv):
                 "pelvis_tilt": jnp.zeros(()),
                 "motor_ref_error": jnp.zeros(()),
                 "com_outside_support": jnp.zeros(()),
-                "airborne": jnp.zeros(()),
-                # "lift_foot": jnp.zeros(()),
-                "reduce_com_error": jnp.zeros(()),
-                "action_rate": jnp.zeros(())
             },
-            "action": jnp.zeros((self.action_size,)), 
             "last_act": jnp.zeros((self.action_size,)),
             # Whether the one-time "lift foot" reward has been granted
             # "lift_foot_given": jnp.array(False),
             # Previous foot contact information
-            "prev_both_feet_contact": jnp.array(False),
             # Last COM error when both feet were on ground
-            "last_both_feet_com_error": jnp.array(0.0),
         }
 
         return mjx_env.State(
@@ -232,7 +223,11 @@ class CassieEnv(mjx_env.MjxEnv):
         rng = state.info["rng"]
         rng, key = jax.random.split(rng)
 
-        torques = self._action_norm2torque(action)
+        torques = self._action_norm2torque(
+            action,
+            self._torque_lowers,
+            self._torque_uppers
+        )
 
         data = mjx_env.step(
             self._mjx_model, state.data, torques, self.n_substeps
@@ -341,8 +336,6 @@ class CassieEnv(mjx_env.MjxEnv):
             "pelvis_lin_vel": self._cost_pelvis_lin_vel(data),
             "pelvis_tilt": self._cost_pelvis_tilt(data),
             "motor_ref_error": self._cost_motor_reference_error(data),
-            "airborne": self._cost_airborne(data),
-            "action_rate": self._cost_action_rate(action, info["last_act"]),
         }
 
         # Event-style components (one-time when triggered)
