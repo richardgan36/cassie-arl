@@ -114,7 +114,7 @@ class CassieEnv(mjx_env.MjxEnv):
 
     def _post_init(self):
         self._init_qpos = jnp.array(self._mj_model.keyframe("home").qpos)
-        self._default_pose = jnp.array(self._mj_model.keyframe("home").qpos[7:])
+        self._standing_jnt_angles = self._init_qpos[QPosIdx.MOTORS]
 
         # Apply soft limits on actuated joints for safe hardware deployment
         self._jnt_lowers = jnp.array(self._mj_model.jnt_range[JntRangeIdx.MOTORS, 0])
@@ -194,7 +194,7 @@ class CassieEnv(mjx_env.MjxEnv):
                 "motor_ref_error": jnp.zeros(()),
                 "com_outside_support": jnp.zeros(()),
             },
-            "last_act": jnp.zeros((self.action_size,)),
+            "last_action": jnp.zeros((self.action_size,)),
             # Whether the one-time "lift foot" reward has been granted
             # "lift_foot_given": jnp.array(False),
             # Previous foot contact information
@@ -257,7 +257,7 @@ class CassieEnv(mjx_env.MjxEnv):
             "step": new_step,
             "rng": rng,
             "reward_components": {**per_step_scaled, **event_scaled},   # For debugging
-            "last_act": action,  # For action rate cost
+            "last_action": action,  # For action rate cost
         }
         return state.replace(
             data=data,
@@ -288,7 +288,7 @@ class CassieEnv(mjx_env.MjxEnv):
         pelvis_height = data.qpos[QPosIdx.BASE_HEIGHT]  # shape (1,)
 
         # Use difference between current motor angles and the standing pose
-        motor_qpos_delta = motor_qpos - StandingPose.MOTOR_ANGLES
+        motor_qpos_delta = motor_qpos - self._standing_jnt_angles
 
         # Foot contact info (left, right) as floats 0.0/1.0
         left_contact = self._is_in_contact_with_ground(data, self._left_foot_gid)
@@ -336,6 +336,8 @@ class CassieEnv(mjx_env.MjxEnv):
             "pelvis_lin_vel": self._cost_pelvis_lin_vel(data),
             "pelvis_tilt": self._cost_pelvis_tilt(data),
             "motor_ref_error": self._cost_motor_reference_error(data),
+            "action_rate": self._cost_action_rate(action, info["last_action"]),
+            "torques": self._cost_torques(action),
         }
 
         # Event-style components (one-time when triggered)
@@ -399,9 +401,25 @@ class CassieEnv(mjx_env.MjxEnv):
     def _cost_motor_reference_error(self, data: mjx.Data) -> jax.Array:
         """Cost for deviation of the motor angles from reference standing pose."""
         motor_qpos = data.qpos[QPosIdx.MOTORS]
-        err = motor_qpos - StandingPose.MOTOR_ANGLES
+        err = motor_qpos - self._standing_jnt_angles
         err_scale = 0.35  # Normalizing constant (radians)
         cost = jnp.mean((err / err_scale)**2)
+        return jnp.clip(cost, 0, 1)
+    
+    def _cost_action_rate(self, action: jax.Array, last_action: jax.Array) -> jax.Array:
+        """Cost for large changes in action (torque) between steps."""
+        # If action moves through the full range in quarter of a second, incur max cost.
+        act_rate = action - last_action
+        rate_scale = 8.0 * self.dt  # Normalizing constant
+        cost = jnp.mean((act_rate / rate_scale)**2)
+        return jnp.clip(cost, 0, 1)
+    
+    def _cost_torques(self, action: jax.Array) -> jax.Array:
+        """Cost for large torques."""
+        # Use the normalized action as a proxy for torque
+        # Incur max cost if using max torque
+        torque_scale = 1.0  # Normalizing constant
+        cost = jnp.mean((action / torque_scale)**2)
         return jnp.clip(cost, 0, 1)
 
     def _get_termination(self, data: mjx.Data, step: jax.Array) -> jax.Array:

@@ -1,5 +1,5 @@
 <mujoco model="cassie">
-  <compiler eulerseq="zyx" meshdir="assets" texturedir="assets" autolimits="true"/>
+  <compiler eulerseq="zyx" angle="degree" meshdir="assets" texturedir="assets" autolimits="true"/>
 
   <option timestep="0.0005"/>
   <!-- Timestep is set to 0.0005 because the standard Cassie controller runs at 2 kHz -->
