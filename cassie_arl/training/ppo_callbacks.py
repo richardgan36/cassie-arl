@@ -1,4 +1,5 @@
 """Callback functions passed into PPO training loop."""
+from posixpath import basename
 from absl import logging
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -24,7 +25,8 @@ class ProgressCallback:
     def __init__(
             self,
             training_params: dict,
-            script_dir: Path, train_id: str,
+            script_dir: Path,
+            train_id: str,
             save_plot: bool = True
         ):
         self.training_params = training_params
@@ -76,15 +78,23 @@ class ProgressCallback:
 
 class VisualizePolicyCallback:
     """Callable visualization callback for Brax PPO training loop."""
-    def __init__(self, env, jit_reset, jit_step, script_dir: Path, train_id: str):
+    def __init__(self, env, jit_reset, jit_step, script_dir: Path, train_id: str, run_every_n_calls: int = 1):
         self.env = env
         self.jit_reset = jit_reset
         self.jit_step = jit_step
         self.script_dir = script_dir
         self.train_id = train_id
+        # How often to run visualization (in calls). 1 = every call, 2 = every 2nd call, etc.
+        self.run_every_n_calls = run_every_n_calls
+        self._call_count = 0
 
     def __call__(self, current_step: int, make_policy, params):
         try:
+            # Increment call counter and optionally skip this visualization
+            self._call_count += 1
+            if (self._call_count % self.run_every_n_calls) != 0:
+                logging.info(f"Skipping visualization call {self._call_count} (every {self.run_every_n_calls})")
+                return
             start_time = time.time()
             print("")
             logging.info("--- Visualization update ---")
@@ -97,15 +107,40 @@ class VisualizePolicyCallback:
             reward_info_list = []  # Store all reward components
             com_info_list = []  # Store COM, distance, contacts, reward
             lift_foot_info_list = []  # Store foot heights and reward
+            torque_history = []  # list of shape (10,) arrays
+            angle_delta_history = []  # list of shape (10,) arrays from observations
             cumulative_reward = 0.0
             
             for i in range(self.env._config.episode_length):
                 act_rng, rng = jax.random.split(rng)
                 ctrl, _ = inference_fn(state.obs, act_rng)
+
+                torque = self.env._action_norm2torque(
+                    ctrl,
+                    self.env._torque_lowers,
+                    self.env._torque_uppers
+                )
+
                 state = self.jit_step(state, ctrl)
                 if bool(state.done):
                     break
+
+
                 
+                # Store torque history for plotting later
+                torque_history.append(np.array(torque))
+
+                # Store joint angle deltas from observation for plotting later
+                # Observation layout (see CassieEnv._get_obs):
+                # [pelvis_height(1), pelvis_quat(4), motor_qpos_delta(10), ...]
+                try:
+                    motor_delta = np.array(state.obs[5:15])  # shape (10,)
+                    if motor_delta.shape[0] == 10:
+                        angle_delta_history.append(motor_delta)
+                except Exception:
+                    # If for any reason obs shape isn't as expected, skip recording
+                    pass
+
                 # Track rewards
                 step_reward = float(state.reward)
                 cumulative_reward += step_reward
@@ -246,7 +281,7 @@ class VisualizePolicyCallback:
 
             # Save video
             fps = float(1.0 / getattr(self.env, "dt", 0.02))
-            ani_save_dir = self.script_dir / "simulation" / f"{self.train_id}_4"
+            ani_save_dir = self.script_dir / "simulation" / f"{self.train_id}" / "test"
             ani_save_dir.mkdir(parents=True, exist_ok=True)
 
             fig, ax = plt.subplots()
@@ -259,9 +294,104 @@ class VisualizePolicyCallback:
 
             ani = animation.FuncAnimation(fig, update, frames=frames_overlay, interval=1000/fps, blit=True)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            ani_save_path = ani_save_dir / f"rollout_step{current_step}-{timestamp}.mp4"
+            base_name = f"rollout_step{current_step}-{timestamp}"
+            ani_save_path = ani_save_dir / f"{base_name}.mp4"
             ani.save(ani_save_path, writer="ffmpeg", fps=fps)
             plt.close(fig)
+
+            # Torque plotting
+            if len(torque_history) > 0:
+                try:
+                    torque_arr = np.stack(torque_history, axis=0)  # (T, 10)
+                    T = torque_arr.shape[0]
+                    time_axis = np.arange(T) * self.env.dt
+
+                    n_joints = torque_arr.shape[1]
+                    rows, cols = 5, 2
+                    fig_t, axes_t = plt.subplots(rows, cols, figsize=(cols * 6, rows * 3), sharex=True)
+                    axes_ft = axes_t.flatten()
+
+                    joint_names = [
+                        "Left Hip Roll", "Left Hip Yaw", "Left Hip Pitch", "Left Knee", "Left Foot",
+                        "Right Hip Roll", "Right Hip Yaw", "Right Hip Pitch", "Right Knee", "Right Foot"
+                    ]
+
+                    # Left leg torques
+                    for row, j in enumerate(range(0, 5)):
+                        axt_left = axes_ft[row * cols]
+                        axt_left.plot(time_axis, torque_arr[:, j], label='Torque', color='tab:purple', linewidth=1.2)
+                        axt_left.set_title(f"{joint_names[j]}")
+                        axt_left.set_ylabel('Torque (Nm)')
+                        axt_left.grid(alpha=0.3)
+
+                    # Right leg torques
+                    for row, j in enumerate(range(5, 10)):
+                        axt_right = axes_ft[row * cols + 1]
+                        axt_right.plot(time_axis, torque_arr[:, j], label='Torque', color='tab:purple', linewidth=1.2)
+                        axt_right.set_title(f"{joint_names[j]}")
+                        axt_right.grid(alpha=0.3)
+
+                    # X labels bottom row
+                    axes_ft[8].set_xlabel('Time (s)')
+                    axes_ft[9].set_xlabel('Time (s)')
+                    fig_t.suptitle('Applied PD Torques per Joint')
+                    fig_t.tight_layout(rect=[0, 0, 1, 0.96])
+
+                    torque_plot_path = ani_save_dir / f"{base_name}_torques.png"
+                    fig_t.savefig(torque_plot_path, dpi=160)
+                    plt.close(fig_t)
+                    logging.info(f"Saved torque montage to {torque_plot_path}")
+                except Exception as e:
+                    logging.exception(f"Failed generating/saving torque montage: {e}")
+            else:
+                logging.warning("No torque data collected; episode ended before first step?")
+
+            # Joint angle delta plotting (from observations)
+            if len(angle_delta_history) > 0:
+                try:
+                    angle_arr = np.stack(angle_delta_history, axis=0)  # (T, 10)
+                    T_angles = angle_arr.shape[0]
+                    time_axis_angles = np.arange(T_angles) * self.env.dt
+
+                    n_joints = angle_arr.shape[1]
+                    rows, cols = 5, 2
+                    fig_a, axes_a = plt.subplots(rows, cols, figsize=(cols * 6, rows * 3), sharex=True)
+                    axes_fa = axes_a.flatten()
+
+                    joint_names = [
+                        "Left Hip Roll", "Left Hip Yaw", "Left Hip Pitch", "Left Knee", "Left Foot",
+                        "Right Hip Roll", "Right Hip Yaw", "Right Hip Pitch", "Right Knee", "Right Foot"
+                    ]
+
+                    # Left leg angle deltas
+                    for row, j in enumerate(range(0, 5)):
+                        ax_left = axes_fa[row * cols]
+                        ax_left.plot(time_axis_angles, angle_arr[:, j], label='Angle Δ', color='tab:blue', linewidth=1.2)
+                        ax_left.set_title(f"{joint_names[j]}")
+                        ax_left.set_ylabel('Δ Angle (rad)')
+                        ax_left.grid(alpha=0.3)
+
+                    # Right leg angle deltas
+                    for row, j in enumerate(range(5, 10)):
+                        ax_right = axes_fa[row * cols + 1]
+                        ax_right.plot(time_axis_angles, angle_arr[:, j], label='Angle Δ', color='tab:blue', linewidth=1.2)
+                        ax_right.set_title(f"{joint_names[j]}")
+                        ax_right.grid(alpha=0.3)
+
+                    # X labels bottom row
+                    axes_fa[8].set_xlabel('Time (s)')
+                    axes_fa[9].set_xlabel('Time (s)')
+                    fig_a.suptitle('Joint Angle Deltas (from observations)')
+                    fig_a.tight_layout(rect=[0, 0, 1, 0.96])
+
+                    angles_plot_path = ani_save_dir / f"{base_name}_angle_deltas.png"
+                    fig_a.savefig(angles_plot_path, dpi=160)
+                    plt.close(fig_a)
+                    logging.info(f"Saved joint angle delta montage to {angles_plot_path}")
+                except Exception as e:
+                    logging.exception(f"Failed generating/saving joint angle delta montage: {e}")
+            else:
+                logging.warning("No joint angle delta data collected; episode ended before first step?")
 
             end_time = time.time()
             duration = timedelta(seconds=end_time - start_time)
