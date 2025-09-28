@@ -5,6 +5,7 @@ import jax
 import jax.numpy as jnp
 import mujoco as mj
 import mujoco.mjx as mjx
+from flax import struct
 from ml_collections import config_dict
 from mujoco_playground._src import mjx_env
 
@@ -14,6 +15,33 @@ import cassie_arl.rl_env.math_utils as math_utils
 
 script_dir = Path(__file__).parent
 CASSIE_SCENE_XML = script_dir.parent / "models" / "scene.xml"
+
+
+@struct.dataclass
+class RewardComponents:
+    """PyTree for per-step reward components kept in state.info.
+
+    Storing rewards in a dataclass makes the structure static and JIT-friendly
+    (vs an arbitrary dict). All leaves are jax.Arrays with scalar shape ().
+    """
+    alive: jax.Array
+    pelvis_lin_vel: jax.Array
+    pelvis_tilt: jax.Array
+    motor_ref_error: jax.Array
+    action_rate: jax.Array
+    torques: jax.Array
+
+    @classmethod
+    def zeros(cls) -> "RewardComponents":
+        z = jnp.zeros(())
+        return cls(
+            alive=z,
+            pelvis_lin_vel=z,
+            pelvis_tilt=z,
+            motor_ref_error=z,
+            action_rate=z,
+            torques=z,
+        )
 
 
 def default_config() -> config_dict.ConfigDict:
@@ -130,15 +158,8 @@ class CassieEnv(mjx_env.MjxEnv):
         info = {
             "rng": rng,
             "step": 0,
-            "reward_components": {
-                "alive": jnp.zeros(()),
-                "pelvis_lin_vel": jnp.zeros(()),
-                "pelvis_tilt": jnp.zeros(()),
-                "motor_ref_error": jnp.zeros(()),
-                "com_outside_support": jnp.zeros(()),
-                "action_rate": jnp.zeros(()),
-                "torques": jnp.zeros(()),
-            },
+            # Keep reward components as a PyTree for JIT friendliness.
+            "reward_components": RewardComponents.zeros(),
             "last_action": jnp.zeros((self.action_size,)),
             # Whether the one-time "lift foot" reward has been granted
             # "lift_foot_given": jnp.array(False),
@@ -201,7 +222,8 @@ class CassieEnv(mjx_env.MjxEnv):
             **state.info,
             "step": new_step,
             "rng": rng,
-            "reward_components": {**per_step_scaled},   # For debugging
+            # Store reward components as a PyTree for stability under JIT.
+            "reward_components": RewardComponents(**per_step_scaled),
             "last_action": action,  # For action rate cost
         }
         return state.replace(
@@ -285,7 +307,7 @@ class CassieEnv(mjx_env.MjxEnv):
         v_sq = jnp.mean(pelvis_lin_vel**2)
         v_scale = 0.8**2  # Normalizing constant (m/s)^2
         cost = v_sq / v_scale
-        return jnp.clip(cost, 0, 1)
+        return jnp.clip(cost, 0.0, 1.0)
 
     def _cost_pelvis_tilt(self, data: mjx.Data) -> jax.Array:
         """Cost for pelvis orientation (deviation from standing)."""
@@ -309,15 +331,15 @@ class CassieEnv(mjx_env.MjxEnv):
         err = motor_qpos - self._standing_jnt_angles
         err_scale = 0.35  # Normalizing constant (radians)
         cost = jnp.mean((err / err_scale)**2)
-        return jnp.clip(cost, 0, 1)
-    
+        return jnp.clip(cost, 0.0, 1.0)
+
     def _cost_action_rate(self, action: jax.Array, last_action: jax.Array) -> jax.Array:
         """Cost for large changes in action (torque) between steps."""
         # If action moves through the full range in quarter of a second, incur max cost.
         act_rate = action - last_action
         rate_scale = 8.0 * self.dt  # Normalizing constant
         cost = jnp.mean((act_rate / rate_scale)**2)
-        return jnp.clip(cost, 0, 1)
+        return jnp.clip(cost, 0.0, 1.0)
     
     def _cost_torques(self, action: jax.Array) -> jax.Array:
         """Cost for large torques."""
@@ -325,7 +347,7 @@ class CassieEnv(mjx_env.MjxEnv):
         # Incur max cost if using max torque
         torque_scale = 1.0  # Normalizing constant
         cost = jnp.mean((action / torque_scale)**2)
-        return jnp.clip(cost, 0, 1)
+        return jnp.clip(cost, 0.0, 1.0)
 
     def _get_termination(self, data: mjx.Data, step: jax.Array) -> jax.Array:
         """Return True if Cassie has fallen or max timesteps reached."""
