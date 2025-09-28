@@ -1,5 +1,4 @@
 """Callback functions passed into PPO training loop."""
-from posixpath import basename
 from absl import logging
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -13,7 +12,6 @@ import numpy as np
 import cv2
 from brax.training import types
 
-from cassie_arl.rl_env.math_utils import vec_xy_world_to_base
 from cassie_arl.config.cassie_consts import *
 
 
@@ -71,7 +69,7 @@ class ProgressCallback:
             return
 
         timestamp_day = datetime.now().strftime("%Y-%m-%d")
-        save_path = self.script_dir / "progress" / self.train_id / f"progress_{timestamp_day}.png"
+        save_path = self.script_dir / "progress" / self.train_id / f"progress.png"
         save_path.parent.mkdir(parents=True, exist_ok=True)
         plt.savefig(str(save_path), dpi=150, bbox_inches="tight")
 
@@ -105,7 +103,6 @@ class VisualizePolicyCallback:
 
             traj = []
             reward_info_list = []  # Store all reward components
-            com_info_list = []  # Store COM, distance, contacts, reward
             lift_foot_info_list = []  # Store foot heights and reward
             torque_history = []  # list of shape (10,) arrays
             angle_delta_history = []  # list of shape (10,) arrays from observations
@@ -154,20 +151,6 @@ class VisualizePolicyCallback:
                 
                 traj.append(state)
 
-                # ---- COM info ----
-                vec_to_support_world = self.env._vector_com_to_support(state.data)
-                vec_to_support_base = vec_xy_world_to_base(vec_to_support_world, state.data.qpos[QPosIdx.BASE_QUAT])
-                dist_to_support = np.linalg.norm(np.array(vec_to_support_world))
-                left_contact = bool(self.env._is_in_contact_with_ground(state.data, self.env._left_foot_gid))
-                right_contact = bool(self.env._is_in_contact_with_ground(state.data, self.env._right_foot_gid))
-                com_info_list.append({
-                    "dist": dist_to_support,
-                    "com_outside_support":  dist_to_support > self.env._config.com_outside_support_threshold,
-                    "left_contact": left_contact,
-                    "right_contact": right_contact,
-                    "vec_to_support": np.array(vec_to_support_base),
-                })
-
                 # ---- Foot lift info ----
                 # Use body positions (xpos) for foot z coordinates;
                 left_foot_z = float(np.array(state.data.xpos[self.env._left_foot_id, 2])) - FOOT_OFFSET
@@ -193,7 +176,7 @@ class VisualizePolicyCallback:
             scene_option.flags[mj.mjtVisFlag.mjVIS_PERTFORCE] = False
             frames = self.env.render(traj, camera="track", scene_option=scene_option, width=640*2, height=480)
 
-            # Overlay COM sphere and text
+            # Overlay diagnostic text
             frames_overlay = []
             # Get reward scale config for showing raw and weighted values
             reward_scales = {k: float(v) for k, v in self.env._config.reward_config.scales.items()}
@@ -201,13 +184,6 @@ class VisualizePolicyCallback:
             for f_idx, frame in enumerate(frames):
                 frame_rgb = np.array(frame).copy()
                 
-                # COM info
-                com_info = com_info_list[f_idx]
-                com_outside_support = com_info['com_outside_support']
-                vec_to_support = com_info['vec_to_support']
-                com_vec_x = vec_to_support[0]
-                com_vec_y = vec_to_support[1]
-
                 # Foot info
                 lift_foot_info = lift_foot_info_list[f_idx]
                 left_foot_z = lift_foot_info['left_foot_z']
@@ -222,10 +198,6 @@ class VisualizePolicyCallback:
 
                 # Left side text - standard info
                 left_text_lines = [
-                    f"COM outside support: {com_outside_support}",
-                    f"COM->Support dist: {com_info['dist']:.3f} m",
-                    f"Vec to support (base): ({com_vec_x:.3f}, {com_vec_y:.3f}) m",
-                    f"L contact: {com_info['left_contact']}, R contact: {com_info['right_contact']}",
                     f"Left foot z: {left_foot_z:.3f} m",
                     f"Right foot z: {right_foot_z:.3f} m",
                     # f"Lift foot reward given: {lift_foot_given}",
@@ -280,8 +252,12 @@ class VisualizePolicyCallback:
                 frames_overlay.append(frame_rgb)
 
             # Save video
-            fps = float(1.0 / getattr(self.env, "dt", 0.02))
-            ani_save_dir = self.script_dir / "simulation" / f"{self.train_id}" / "test"
+            # Pace playback by control step, not physics substep: real-time independent of sim_dt
+            # The `env.dt` from the wrapper can be misleading. We use the unwrapped env's
+            # `ctrl_dt` to get the true time per frame.
+            dt_frame = float(self.env._config.ctrl_dt)
+            fps = float(1.0 / dt_frame)
+            ani_save_dir = self.script_dir / "simulation" / f"{self.train_id}"
             ani_save_dir.mkdir(parents=True, exist_ok=True)
 
             fig, ax = plt.subplots()
@@ -304,7 +280,8 @@ class VisualizePolicyCallback:
                 try:
                     torque_arr = np.stack(torque_history, axis=0)  # (T, 10)
                     T = torque_arr.shape[0]
-                    time_axis = np.arange(T) * self.env.dt
+                    # Use control step for horizontal axis to reflect real-time
+                    time_axis = np.arange(T) * dt_frame
 
                     n_joints = torque_arr.shape[1]
                     rows, cols = 5, 2
@@ -351,7 +328,7 @@ class VisualizePolicyCallback:
                 try:
                     angle_arr = np.stack(angle_delta_history, axis=0)  # (T, 10)
                     T_angles = angle_arr.shape[0]
-                    time_axis_angles = np.arange(T_angles) * self.env.dt
+                    time_axis_angles = np.arange(T_angles) * dt_frame
 
                     n_joints = angle_arr.shape[1]
                     rows, cols = 5, 2

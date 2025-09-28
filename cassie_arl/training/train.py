@@ -1,5 +1,4 @@
 # Python built-in packages
-from datetime import datetime
 import functools
 from pathlib import Path
 
@@ -23,32 +22,32 @@ network_factory_params = {
     "policy_obs_key": "state",
     "value_hidden_layer_sizes": (512, 256, 128),
     "value_obs_key": "privileged_state",
-    "init_noise_std": 2.0,          # Added to increase exploration
-    "state_dependent_std": True,    # Added to increase exploration
+    # "init_noise_std": 2.0,          # Added to increase exploration
+    # "state_dependent_std": True,    # Added to increase exploration
 }
 
 ppo_training_params = {
     'action_repeat': 1,
     'batch_size': 256,
     'clipping_epsilon': 0.2,
-    'discounting': 0.98,  # TODO: Used to be 0.97. Change back?
-    'entropy_cost': 1e-2,  # Increased initially to encourage exploration. TODO: anneal down to 0?
-    'episode_length': 512,
-    'learning_rate': 1e-3,  # Was 3e-4
+    'discounting': 0.97,  # TODO: Used to be 0.97. Change back?
+    'entropy_cost': 0.005,  # Increased initially to encourage exploration. TODO: anneal down to 0?
+    'episode_length': 1024,
+    'learning_rate': 3e-4,  # Was 3e-4
     'max_grad_norm': 1.0,
     'normalize_observations': True,
-    'num_envs': 4096,
+    'num_envs': 8192,
     'num_evals': 20,
-    'num_minibatches': 320,
+    'num_minibatches': 32,
     'num_resets_per_eval': 1,
-    'num_timesteps': 200_000_000,
+    'num_timesteps': 150_000_000,
     'num_updates_per_batch': 4,
-    'reward_scaling': 2.0,
+    'reward_scaling': 1.0,
     'unroll_length': 20,
     'restore_value_fn': True,
 }
 
-train_id = "cassie_obs38"  # Observation space is 38D
+train_id = "cassie_find_eq_torques_3"  # This training is purely to find the torques required to hold the standing pose
 env = CassieEnv()
 
 # JIT-wrapped env functions kept as local variables and passed into the visualization callback
@@ -64,23 +63,23 @@ network_factory = functools.partial(
 )
 
 # # --- Shorten training for testing ---
-# ppo_training_params["num_evals"] = 3
+# ppo_training_params["num_evals"] = 2
 # ppo_training_params["episode_length"] = 5
 # ppo_training_params["num_envs"] = 1
 # ppo_training_params["num_minibatches"] = 4
 # ppo_training_params["batch_size"] = 2
 # ppo_training_params["unroll_length"] = 8
-# ppo_training_params["num_timesteps"] = 1002
+# ppo_training_params["num_timesteps"] = 100
 
 logging.info("PPO training parameters:")
 logging.info(ppo_training_params)
 
-save_ckpt_dir = script_dir / "checkpoints" / f"{train_id}_4"
-restore_ckpt_path = script_dir / "checkpoints" / f"{train_id}_4" / "000003276800"
+save_ckpt_dir = script_dir / "checkpoints" / f"{train_id}"
+# restore_ckpt_path = script_dir / "checkpoints" / f"{train_id}" / "000080281600"
 
 # Instantiate callback objects
 progress_cb = ProgressCallback(ppo_training_params, script_dir, train_id, save_plot=True)
-viz_cb = VisualizePolicyCallback(env, jit_reset, jit_step, script_dir, train_id)
+viz_cb = VisualizePolicyCallback(env, jit_reset, jit_step, script_dir, train_id, run_every_n_calls=2)
 
 train_fn = functools.partial(
     ppo.train, **dict(ppo_training_params),
@@ -88,8 +87,8 @@ train_fn = functools.partial(
     randomization_fn=randomizer,
     progress_fn=progress_cb,
     policy_params_fn=viz_cb,
-    save_checkpoint_path=str(save_ckpt_dir),
-    restore_checkpoint_path=restore_ckpt_path.as_posix()
+    save_checkpoint_path=save_ckpt_dir.as_posix(),
+    # restore_checkpoint_path=restore_ckpt_path.as_posix()
 )
 
 if "save_checkpoint_path" in train_fn.keywords:

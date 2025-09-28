@@ -1,4 +1,3 @@
-import os
 from typing import Any, Dict, Optional, Union
 from pathlib import Path
 
@@ -22,71 +21,28 @@ def default_config() -> config_dict.ConfigDict:
         # --------------------------------
         # Required simulation parameters
         # --------------------------------
-        ctrl_dt=0.01,
+        ctrl_dt=0.02,
         sim_dt=0.0005,  # Match "timestep" in MJCF
-        episode_length=1000,  # 10 seconds at ctrl_dt=0.01
-        action_repeat=1,
+        episode_length=500,  # 10 seconds at ctrl_dt=0.02
         history_len=1,
 
         # -------------------
         # Custom parameters
         # -------------------
 
-        # PD gains for the 10 actuated joints
-        # Values are from Z Li et al. 2024 but scaled down to avoid excessive saturation
-        p_gain = jnp.array([
-            8, 4, 4, 10, 0.4,
-            8, 4, 4, 10, 0.4
-        ]),
-        d_gain = jnp.array([
-            0.08, 0.08, 0.2, 0.4, 0.08,
-            0.08, 0.08, 0.2, 0.0, 0.08
-        ]),
-        pd_uncertainty=0.00,  # ±0% uniform randomization of PD gains per episode
-        
-        # Soft joint limits as a fraction of total joint range
-        # (1.0 = full range, 0.0 = no movement allowed)
-        soft_joint_pos_limit_factors=jnp.array([
-            0.5, 0.8, 0.95, 0.95, 0.95,  # L_HIP_ROLL, L_HIP_YAW, L_HIP_PITCH, L_KNEE, L_FOOT
-            0.5, 0.8, 0.95, 0.95, 0.95   # R_HIP_ROLL, R_HIP_YAW, R_HIP_PITCH, R_KNEE, R_FOOT
-        ]),
-        obs_noise_config=config_dict.create(
-            level=0.0,  # Set to 0.0 to disable noise.
-            scales=config_dict.create(  # TODO: define scale of noise for observations
-                gyro=0.2,  # Not used
-            ),
-        ),
-        reset_noise_config=config_dict.create(
-            level=0.0,  # Set to 0.0 to disable noise.
-            scales=config_dict.create(  # TODO: define scale of noise for reset
-                xy=jnp.array([-0.5, 0.5]),      # Additive
-                z=jnp.array([0, 0.1]),          # Additive
-                yaw=jnp.array([-3.14, 3.14]),   # Set absolute
-                motors=jnp.array([-0.05, 0.05]),  # Multiplicative: Motors *= U(1-0.05, 1+0.05)
-                dxyz=jnp.array([-0.2, 0.2]),    # Additive
-                drpy=jnp.array([-0.2, 0.2]),    # Additive
-            ),
-        ),
-
         # Reward function configuration
         # Except for the "fall" cost, which is a one-time cost, all reward weights
         # are in [0, 1] and all cost weights are in [-1, 0].
         reward_config=config_dict.create(
             scales=config_dict.create(
-                alive=1.0,
-                fall=-5.0,
-                com_outside_support=-0.2,
-                pelvis_lin_vel=-0.4,
-                pelvis_tilt=-0.4,
-                motor_ref_error=-0.7,
+                alive=1.5,
+                pelvis_lin_vel=-0.7,
+                pelvis_tilt=-0.5,
+                motor_ref_error=-0.6,
+                action_rate=-0.2,
+                torques=-0.1,
             ),
-        ),
-        # Parameters for the "lift foot" reward
-        # If the COM is further than `com_outside_support_threshold` (m) from the
-        # support polygon and exactly one foot is lifted with at least
-        # `lift_foot_clearance` (m) clearance from the ground, the
-        # environment returns a binary reward (1.0) for that component.
-        com_outside_support_threshold=0.06,     # meters
+        )
     )
 
 
@@ -115,14 +71,8 @@ class CassieEnv(mjx_env.MjxEnv):
     def _post_init(self):
         self._init_qpos = jnp.array(self._mj_model.keyframe("home").qpos)
         self._standing_jnt_angles = self._init_qpos[QPosIdx.MOTORS]
-
-        # Apply soft limits on actuated joints for safe hardware deployment
-        self._jnt_lowers = jnp.array(self._mj_model.jnt_range[JntRangeIdx.MOTORS, 0])
-        self._jnt_uppers = jnp.array(self._mj_model.jnt_range[JntRangeIdx.MOTORS, 1])
-        jnt_c = (self._jnt_lowers + self._jnt_uppers) / 2
-        jnt_r = self._jnt_uppers - self._jnt_lowers
-        self._jnt_soft_lowers = jnt_c - 0.5 * jnt_r * self._config.soft_joint_pos_limit_factors
-        self._jnt_soft_uppers = jnt_c + 0.5 * jnt_r * self._config.soft_joint_pos_limit_factors
+        standing_quat = self._init_qpos[QPosIdx.BASE_QUAT]
+        self._standing_base_rpy = math_utils.quat2euler(standing_quat)
 
         self._torque_lowers = jnp.array(self._mj_model.actuator_ctrlrange[:, 0])
         self._torque_uppers = jnp.array(self._mj_model.actuator_ctrlrange[:, 1])
@@ -143,9 +93,6 @@ class CassieEnv(mjx_env.MjxEnv):
 
         self._left_foot_gid = geoms_of_body(self._mj_model, self._left_foot_id)
         self._right_foot_gid = geoms_of_body(self._mj_model, self._right_foot_id)
-
-        self._p_gain = self._config.p_gain
-        self._d_gain = self._config.d_gain
 
     # ----------------------------------------------------------------------
     # Required abstract methods/properties
@@ -177,9 +124,6 @@ class CassieEnv(mjx_env.MjxEnv):
         qpos = self._init_qpos
         qvel = jnp.zeros(self._mjx_model.nv)
 
-        rng, qpos, qvel = self._add_perturbations(rng, qpos, qvel)
-        rng, p_gain, d_gain = self._randomize_pd_gain(rng)
-
         data = mjx_env.init(self._mjx_model, qpos=qpos, qvel=qvel)
         obs = self._get_obs(data)
 
@@ -188,11 +132,12 @@ class CassieEnv(mjx_env.MjxEnv):
             "step": 0,
             "reward_components": {
                 "alive": jnp.zeros(()),
-                "fall": jnp.zeros(()),
                 "pelvis_lin_vel": jnp.zeros(()),
                 "pelvis_tilt": jnp.zeros(()),
                 "motor_ref_error": jnp.zeros(()),
                 "com_outside_support": jnp.zeros(()),
+                "action_rate": jnp.zeros(()),
+                "torques": jnp.zeros(()),
             },
             "last_action": jnp.zeros((self.action_size,)),
             # Whether the one-time "lift foot" reward has been granted
@@ -221,7 +166,8 @@ class CassieEnv(mjx_env.MjxEnv):
                     the 10 actuated joints.
         """
         rng = state.info["rng"]
-        rng, key = jax.random.split(rng)
+
+        action = jnp.clip(action, -1.0, 1.0)
 
         torques = self._action_norm2torque(
             action,
@@ -237,14 +183,13 @@ class CassieEnv(mjx_env.MjxEnv):
 
         # Get reward components. `_get_reward` returns ((per_step_raw, event_raw), (lift_given_new, current_both_feet, current_com_error))
         # (per_step_raw, event_raw), (lift_given_new, current_both_feet, current_com_error) = self._get_reward(data, action, state.info)
-        (per_step_raw, event_raw) = self._get_reward(data, action, state.info)
+        per_step_raw = self._get_reward(data, action, state.info)
 
         # Scale each component by its configured weight
         per_step_scaled = {k: per_step_raw[k] * self._config.reward_config.scales[k] for k in per_step_raw}
-        event_scaled = {k: event_raw[k] * self._config.reward_config.scales[k] for k in event_raw}
 
         # Per-step components are integrated over dt; event components are added directly
-        reward = sum(per_step_scaled.values()) * self.dt + sum(event_scaled.values())
+        reward = sum(per_step_scaled.values()) * self.dt
         reward = jnp.clip(reward, -1000, 1000)
 
         new_step = state.info.get("step", 0) + 1
@@ -256,7 +201,7 @@ class CassieEnv(mjx_env.MjxEnv):
             **state.info,
             "step": new_step,
             "rng": rng,
-            "reward_components": {**per_step_scaled, **event_scaled},   # For debugging
+            "reward_components": {**per_step_scaled},   # For debugging
             "last_action": action,  # For action rate cost
         }
         return state.replace(
@@ -290,13 +235,6 @@ class CassieEnv(mjx_env.MjxEnv):
         # Use difference between current motor angles and the standing pose
         motor_qpos_delta = motor_qpos - self._standing_jnt_angles
 
-        # Foot contact info (left, right) as floats 0.0/1.0
-        left_contact = self._is_in_contact_with_ground(data, self._left_foot_gid)
-        right_contact = self._is_in_contact_with_ground(data, self._right_foot_gid)
-        left_contact_f = jnp.where(left_contact, 1.0, 0.0)
-        right_contact_f = jnp.where(right_contact, 1.0, 0.0)
-        foot_contact = jnp.array([left_contact_f, right_contact_f])
-
         # Concatenate into a single vector. Order chosen to keep base-state first,
         # then motor errors and velocities, then pelvis vel, then foot contact and com->support.
         obs = jnp.concatenate([
@@ -304,8 +242,7 @@ class CassieEnv(mjx_env.MjxEnv):
             pelvis_quat,
             motor_qpos_delta,
             pelvis_qvel,
-            motor_qvel,
-            foot_contact
+            motor_qvel
         ])
 
         return obs
@@ -315,10 +252,7 @@ class CassieEnv(mjx_env.MjxEnv):
             data: mjx.Data,
             action: jax.Array,
             info: Dict[str, Any]
-        ) -> tuple[
-                tuple[dict[str, jax.Array], dict[str, jax.Array]],
-                tuple[jax.Array, jax.Array, jax.Array]
-            ]:
+        ) -> Dict[str, jax.Array]:
         """
         Computes reward components.
 
@@ -332,7 +266,6 @@ class CassieEnv(mjx_env.MjxEnv):
         # Split components into per-step (integrated over dt) and event (one-time) rewards.
         per_step = {
             "alive": self._reward_alive(),
-            "com_outside_support": self._cost_com_outside_support(data),
             "pelvis_lin_vel": self._cost_pelvis_lin_vel(data),
             "pelvis_tilt": self._cost_pelvis_tilt(data),
             "motor_ref_error": self._cost_motor_reference_error(data),
@@ -340,39 +273,11 @@ class CassieEnv(mjx_env.MjxEnv):
             "torques": self._cost_torques(action),
         }
 
-        # Event-style components (one-time when triggered)
-        event = {
-            "fall": self._cost_fall(data),
-        }
-
-        return (per_step, event)
+        return per_step
 
     def _reward_alive(self) -> jax.Array:
         """Reward for staying 'alive' (not falling over)."""
         return jnp.array(1.0)
-    
-    def _cost_fall(self, data: mjx.Data) -> jax.Array:
-        """One time cost for falling over."""
-        fallen = self._has_fallen(data)
-        # If fallen, return 1.0 as a one-time event cost.
-        return jnp.where(fallen, 1.0, 0.0)
-
-    def _cost_com_outside_support(self, data: mjx.Data) -> jax.Array:
-        """
-        Cost for distance of the center of mass from the support polygon.
-
-        The support polygon is a line segment if both feet are on the ground,
-        or a point if one foot is on the ground. If both feet are in the air,
-        the cost is zero. Cost for being airborne is penalized in _cost_airborne.
-        """
-        # Compute simplified distance to support (segment/point)
-        vec_to_support = self._vector_com_to_support(data)
-        dist = jnp.linalg.norm(vec_to_support)
-
-        # Exponential scaling: reaches 0.4 at distance == sigma
-        sigma = self._config.com_outside_support_threshold
-        cost = 1 - jnp.exp(- (dist**2) / (2 * sigma**2))
-        return jnp.clip(cost, 0.0, 1.0)
     
     def _cost_pelvis_lin_vel(self, data: mjx.Data) -> jax.Array:
         """Cost for pelvis linear velocity."""
@@ -384,12 +289,12 @@ class CassieEnv(mjx_env.MjxEnv):
 
     def _cost_pelvis_tilt(self, data: mjx.Data) -> jax.Array:
         """Cost for pelvis orientation (deviation from standing)."""
-        # Get pelvis quaternion
-        pelvis_quat = data.qpos[QPosIdx.BASE_QUAT]
-        rpy = math_utils.quat2euler(pelvis_quat)
+        # Get base quaternion
+        base_quat = data.qpos[QPosIdx.BASE_QUAT]
+        rpy = math_utils.quat2euler(base_quat)
 
         # Only roll and pitch
-        orientation_err = math_utils.angle_diff(rpy[:2], StandingPose.PELVIS_RPY[:2])
+        orientation_err = math_utils.angle_diff(rpy[:2], self._standing_base_rpy[:2])
 
         # Mean squared error, normalized
         err_scale = 0.35  # radians (~20 degrees)
@@ -431,94 +336,6 @@ class CassieEnv(mjx_env.MjxEnv):
 
         done = jnp.logical_or(fallen, max_steps_reached)
         return done
-    
-    def _add_perturbations(
-            self, rng: jax.Array, qpos: jax.Array, qvel: jax.Array
-    ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        """Add uniform random perturbations to base and motor positions/velocities."""
-        rng, key = jax.random.split(rng)
-        qpos = qpos.at[QPosIdx.BASE_XY].add(
-            jax.random.uniform(
-                key,
-                (2,),
-                minval=self._config.reset_noise_config.scales.xy[0] * self._config.reset_noise_config.level,
-                maxval=self._config.reset_noise_config.scales.xy[1] * self._config.reset_noise_config.level
-            )
-        )
-
-        rng, key = jax.random.split(rng)
-        qpos = qpos.at[QPosIdx.BASE_HEIGHT].add(
-            jax.random.uniform(
-                key,
-                (1,),
-                minval=self._config.reset_noise_config.scales.z[0] * self._config.reset_noise_config.level,
-                maxval=self._config.reset_noise_config.scales.z[1] * self._config.reset_noise_config.level
-            )
-        )
-
-        rng, key = jax.random.split(rng)
-        yaw = jax.random.uniform(
-            key,
-            (1,),
-            minval=self._config.reset_noise_config.scales.yaw[0] * self._config.reset_noise_config.level,
-            maxval=self._config.reset_noise_config.scales.yaw[1] * self._config.reset_noise_config.level
-        )
-        quat = math_utils.euler2quat(jnp.array([0.0, 0.0, yaw[0]]))
-        qpos = qpos.at[QPosIdx.BASE_QUAT].set(quat)
-
-        # Noise is multiplicative on motor angles
-        rng, key = jax.random.split(rng)
-        qpos = qpos.at[QPosIdx.MOTORS].multiply(
-            jax.random.uniform(
-                key,
-                (10,),
-                minval=1 - self._config.reset_noise_config.scales.motors[0] * self._config.reset_noise_config.level,
-                maxval=1 + self._config.reset_noise_config.scales.motors[1] * self._config.reset_noise_config.level
-            )
-        )
-
-        rng, key = jax.random.split(rng)
-        dxyz_delta = jax.random.uniform(
-            key, 
-            (3,),
-            minval=self._config.reset_noise_config.scales.dxyz[0] * self._config.reset_noise_config.level,
-            maxval=self._config.reset_noise_config.scales.dxyz[1] * self._config.reset_noise_config.level
-        )
-        rng, key = jax.random.split(rng)
-        drpy_delta = jax.random.uniform(
-            key,
-            (3,),
-            minval=self._config.reset_noise_config.scales.drpy[0] * self._config.reset_noise_config.level,
-            maxval=self._config.reset_noise_config.scales.drpy[1] * self._config.reset_noise_config.level
-        )
-
-        qvel = qvel.at[QVelIdx.BASE].add(
-            jnp.concatenate([dxyz_delta, drpy_delta])
-        )
-
-        return rng, qpos, qvel
-    
-    def _randomize_pd_gain(self, rng: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
-        """Returns PD gains with an uncertainty applied."""
-        rng, key = jax.random.split(rng)
-        p_gain = (self._config.p_gain *
-                  jax.random.uniform(
-                      key,
-                      shape=self._config.p_gain.shape,
-                      minval=1.0 - self._config.pd_uncertainty,
-                      maxval=1.0 + self._config.pd_uncertainty
-                  )
-        )
-        rng, key = jax.random.split(rng)
-        d_gain = (self._config.d_gain *
-                  jax.random.uniform(
-                      key,
-                      shape=self._config.d_gain.shape,
-                      minval=1.0 - self._config.pd_uncertainty,
-                      maxval=1.0 + self._config.pd_uncertainty
-                  )
-        )
-        return rng, p_gain, d_gain
 
     def _action_norm2torque(
             self,
@@ -529,30 +346,8 @@ class CassieEnv(mjx_env.MjxEnv):
         """
         Converts normalized action in [-1, 1] to torques.
         """
-
         # Scale action to torque range
-        return torque_lb + 0.5 * (torque_ub - torque_lb) * (action + 1)
-
-    def _pd_control(
-            self,
-            data: mjx.Data,
-            pos_targets: jax.Array,
-            p_gain: jax.Array,
-            d_gain: jax.Array,
-            torque_lb: jax.Array,
-            torque_ub: jax.Array,
-    ) -> jax.Array:
-        """Computes PD control torques for the actuated joints."""
-        # Current motor positions and velocities
-        motor_qpos = data.qpos[QPosIdx.MOTORS]
-        motor_qvel = data.qvel[QVelIdx.MOTORS]
-
-        # PD control
-        pos_err = pos_targets - motor_qpos
-        vel_err = -motor_qvel  # Target vel is zero
-
-        torques = p_gain * pos_err + d_gain * vel_err + StandingPose.MOTOR_TORQUES
-        return jnp.clip(torques, torque_lb, torque_ub)
+        return torque_lb + 0.5 * (torque_ub - torque_lb) * (action + 1.0)
     
     def _has_fallen(self, data: mjx.Data) -> jax.Array:
         """Returns True if Cassie has fallen (pelvis height below threshold or tarsus hit ground)."""
@@ -569,78 +364,4 @@ class CassieEnv(mjx_env.MjxEnv):
         right_hit = right_tarsus_z < TARSUS_HIT_GROUND_THRESHOLD
         
         return jnp.logical_or(left_hit, right_hit)
-
-    # ---------------- Support polygon & COM helpers ----------------
-    def _is_in_contact_with_ground(
-            self,
-            data: mjx.Data,
-            geom_ids: jax.Array
-        ) -> jax.Array:
-        """Return a jnp.bool_ indicating whether any geoms in geom_ids are in contact with the ground."""
-        # Only consider contacts with distance <= tol
-        tol = 0.001  # 1mm tolerance
-        mask = data._impl.contact.dist <= tol
-        indices = jnp.where(mask, size=mask.shape[0])[0]
-        geom = data._impl.contact.geom[indices]
-
-        geom_ids = jnp.array(geom_ids, dtype=geom.dtype)
-        floor_gid = jnp.array(self._floor_gid, dtype=geom.dtype)
-
-        # For each contact entry, check if either (geom[:,0] is the geom and geom[:,1] is floor)
-        # or (geom[:,1] is the geom and geom[:,0] is floor). Then reduce with any(). This
-        # naturally handles the empty-contact case (any over empty -> False).
-        match1 = jnp.any(jnp.any(geom[:, 0, None] == geom_ids[None, :], axis=1) & (geom[:, 1] == floor_gid))
-        match2 = jnp.any(jnp.any(geom[:, 1, None] == geom_ids[None, :], axis=1) & (geom[:, 0] == floor_gid))
-        return jnp.logical_or(match1, match2)
-
-    def _vector_com_to_support(self, data: mjx.Data) -> jax.Array:
-        """
-        Compute vector from COM projection to closest point on support geometry.
-
-        Returns a 2D vector (COM_xy -> closest point on support in world frame). 
-        If no feet contact the ground, returns zero vector.
-        """
-        # Foot centers in world frame
-        left_center = jnp.array(data.xpos[self._left_foot_id])
-        right_center = jnp.array(data.xpos[self._right_foot_id])
-
-        # Check contact booleans
-        left_foot_contact = self._is_in_contact_with_ground(data, self._left_foot_gid)
-        right_foot_contact = self._is_in_contact_with_ground(data, self._right_foot_gid)
-
-        com_xy = jnp.array(data.subtree_com[0][:2])
-
-        # Case 1: both feet on the ground (support is a line segment)
-        a = left_center[:2]
-        b = right_center[:2]
-        ab = b - a
-        denom = jnp.dot(ab, ab) + 1e-12
-        t = jnp.clip(jnp.dot(com_xy - a, ab) / denom, 0.0, 1.0)
-        proj = a + t * ab
-        vec_both = proj - com_xy
-
-        # Case 2: only left foot on the ground (support is a point)
-        vec_left = left_center[:2] - com_xy
-
-        # Case 3: only right foot on the ground (support is a point)
-        vec_right = right_center[:2] - com_xy
-
-        # Case 4: no feet on the ground
-        vec_none = jnp.zeros(2)
-
-        # Choose result without Python control flow so the function is jittable.
-        # Order: if both -> vec_both, else if left -> vec_left, else if right -> vec_right, else zero.
-        both = jnp.logical_and(left_foot_contact, right_foot_contact)
-        left_only = jnp.logical_and(left_foot_contact, jnp.logical_not(right_foot_contact))
-        right_only = jnp.logical_and(right_foot_contact, jnp.logical_not(left_foot_contact))
-
-        res_world = jnp.where(
-            both, vec_both, jnp.where(
-                left_only, vec_left, jnp.where(
-                    right_only, vec_right, vec_none
-                )
-            )
-        )
-
-        return res_world
 
