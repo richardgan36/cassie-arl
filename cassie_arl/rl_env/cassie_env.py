@@ -22,7 +22,7 @@ def default_config() -> config_dict.ConfigDict:
         # Required simulation parameters
         # --------------------------------
         ctrl_dt=0.02,
-        sim_dt=0.0005,  # Match "timestep" in MJCF
+        sim_dt=0.001,  # Match "timestep" in MJCF
         episode_length=500,  # 10 seconds at ctrl_dt=0.02
         history_len=1,
 
