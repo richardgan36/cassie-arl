@@ -13,7 +13,7 @@ import cassie_arl.rl_env.math_utils as math_utils
 
 
 script_dir = Path(__file__).parent
-CASSIE_SCENE_XML = script_dir / ".." / "models" / "scene.xml"
+CASSIE_SCENE_XML = script_dir.parent / "models" / "scene.xml"
 
 
 def default_config() -> config_dict.ConfigDict:
