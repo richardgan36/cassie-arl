@@ -58,6 +58,12 @@ def default_config() -> config_dict.ConfigDict:
         # Custom parameters
         # -------------------
 
+        # PD Gains
+        p_gain=jnp.array([200.0, 200.0, 200.0, 100.0, 100.0,
+                          200.0, 200.0, 200.0, 100.0, 100.0]),
+        d_gain=jnp.array([10.0, 10.0, 10.0, 5.0, 5.0,
+                          10.0, 10.0, 10.0, 5.0, 5.0]),
+
         # Reward function configuration
         # Except for the "fall" cost, which is a one-time cost, all reward weights
         # are in [0, 1] and all cost weights are in [-1, 0].
@@ -125,6 +131,10 @@ class CassieEnv(mjx_env.MjxEnv):
         self._left_foot_gid = geoms_of_body(self._mj_model, self._left_foot_id)
         self._right_foot_gid = geoms_of_body(self._mj_model, self._right_foot_id)
 
+        # PD gains
+        self._p_gain = self._config.p_gain
+        self._d_gain = self._config.d_gain
+
     # ----------------------------------------------------------------------
     # Required abstract methods/properties
     # ----------------------------------------------------------------------
@@ -189,14 +199,16 @@ class CassieEnv(mjx_env.MjxEnv):
 
         action = jnp.clip(action, -1.0, 1.0)
 
-        torques = self._action_norm2torque(
-            action,
-            self._torque_lowers,
-            self._torque_uppers
+        pos_targets = self._action2pos_targets(action)
+        torques = self._pd_control(
+            state.data,
+            pos_targets,
+            self._p_gain,
+            self._d_gain
         )
 
         data = mjx_env.step(
-            self._mjx_model, state.data, self._standing_torques, self.n_substeps
+            self._mjx_model, state.data, torques, self.n_substeps
         )
 
         obs = self._get_obs(data)
@@ -385,3 +397,21 @@ class CassieEnv(mjx_env.MjxEnv):
         
         return jnp.logical_or(left_hit, right_hit)
 
+    def _pd_control(
+            self,
+            data: mjx.Data,
+            pos_targets: jax.Array,
+            p_gain: jax.Array,
+            d_gain: jax.Array,
+    ) -> jax.Array:
+        """Computes PD control torques for the actuated joints."""
+        # Current motor positions and velocities
+        motor_qpos = data.qpos[QPosIdx.MOTORS]
+        motor_qvel = data.qvel[QVelIdx.MOTORS]
+
+        # PD control
+        pos_err = pos_targets - motor_qpos
+        vel_err = -motor_qvel  # Target vel is zero
+
+        torques = p_gain * pos_err + d_gain * vel_err + self._standing_torques
+        return jnp.clip(torques, self._torque_lowers, self._torque_uppers)
