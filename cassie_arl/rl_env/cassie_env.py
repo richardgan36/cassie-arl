@@ -59,10 +59,14 @@ def default_config() -> config_dict.ConfigDict:
         # -------------------
 
         # PD Gains
-        p_gain=jnp.array([200.0, 200.0, 200.0, 100.0, 100.0,
-                          200.0, 200.0, 200.0, 100.0, 100.0]),
-        d_gain=jnp.array([10.0, 10.0, 10.0, 5.0, 5.0,
-                          10.0, 10.0, 10.0, 5.0, 5.0]),
+        p_gain = jnp.array([
+            8, 4, 4, 10, 0.4,
+            8, 4, 4, 10, 0.4
+        ]),
+        d_gain = jnp.array([
+            0.08, 0.08, 0.2, 0.4, 0.08,
+            0.08, 0.08, 0.2, 0.4, 0.08
+        ]),
 
         # Reward function configuration
         # Except for the "fall" cost, which is a one-time cost, all reward weights
@@ -72,8 +76,8 @@ def default_config() -> config_dict.ConfigDict:
                 alive=1.5,
                 pelvis_lin_vel=-0.7,
                 pelvis_tilt=-0.5,
-                motor_ref_error=-0.6,
-                action_rate=-1.0,
+                motor_ref_error=-0.7,
+                action_rate=-0.8,
                 torques=-0.3,
             ),
         )

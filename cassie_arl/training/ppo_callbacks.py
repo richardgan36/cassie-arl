@@ -135,19 +135,17 @@ class VisualizePolicyCallback:
                 act_rng, rng = jax.random.split(rng)
                 ctrl, _ = inference_fn(state.obs, act_rng)
 
-                # torque = self.env._action_norm2torque(
-                #     ctrl,
-                #     self.env._torque_lowers,
-                #     self.env._torque_uppers
-                # )
-                torque = self.env._standing_torques
+                torque = self.env._pd_control(
+                    state.data,
+                    ctrl,
+                    self.env._p_gain,
+                    self.env._d_gain,
+                )
 
                 state = self.jit_step(state, torque)
                 if bool(state.done):
                     break
 
-
-                
                 # Store torque history for plotting later
                 torque_history.append(np.array(torque))
 
