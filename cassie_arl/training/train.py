@@ -63,7 +63,7 @@ network_factory = functools.partial(
 )
 
 # --- Shorten training for testing ---
-ppo_training_params["num_evals"] = 2
+ppo_training_params["num_evals"] = 1
 ppo_training_params["episode_length"] = 5
 ppo_training_params["num_envs"] = 1
 ppo_training_params["num_minibatches"] = 4

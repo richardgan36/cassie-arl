@@ -99,6 +99,9 @@ class CassieEnv(mjx_env.MjxEnv):
     def _post_init(self):
         self._init_qpos = jnp.array(self._mj_model.keyframe("home").qpos)
         self._standing_jnt_angles = self._init_qpos[QPosIdx.MOTORS]
+        # self._standing_torques = jnp.array(self._mj_model.keyframe("home").ctrl)
+        self._standing_torques = jnp.array([0, 0, -0.358, 2.4205, 0, 0, 0, -0.358, 2.4205, 0])  # Knee value too low => robot goes up; hip pitch too negative => pelvis tilts backwards
+
         standing_quat = self._init_qpos[QPosIdx.BASE_QUAT]
         self._standing_base_rpy = math_utils.quat2euler(standing_quat)
 
@@ -193,7 +196,7 @@ class CassieEnv(mjx_env.MjxEnv):
         )
 
         data = mjx_env.step(
-            self._mjx_model, state.data, torques, self.n_substeps
+            self._mjx_model, state.data, self._standing_torques, self.n_substeps
         )
 
         obs = self._get_obs(data)
