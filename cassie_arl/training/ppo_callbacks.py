@@ -1,4 +1,5 @@
 """Callback functions passed into PPO training loop."""
+import dataclasses
 from absl import logging
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -86,6 +87,28 @@ class VisualizePolicyCallback:
         self.run_every_n_calls = run_every_n_calls
         self._call_count = 0
 
+    def _reward_components_to_dict(self, rc) -> dict[str, float]:
+        """Converts RewardComponents (flax.struct dataclass) or dict to a plain dict of floats.
+
+        Safe to call regardless of whether rc is a dataclass or a mapping; falls back to best-effort.
+        """
+        try:
+            # Handle flax.struct.dataclass (built on Python dataclasses)
+            if dataclasses.is_dataclass(rc):
+                out = {}
+                for f in dataclasses.fields(rc):
+                    val = getattr(rc, f.name)
+                    # Convert JAX array to Python float for overlay
+                    out[f.name] = float(np.array(val))
+                return out
+            # If it's already a mapping, convert values to float
+            if isinstance(rc, dict):
+                return {k: float(np.array(v)) for k, v in rc.items()}
+        except Exception:
+            pass
+        # Last resort: try tree flatten with names unknown; return empty to avoid crashing overlays
+        return {}
+
     def __call__(self, current_step: int, make_policy, params):
         try:
             # Increment call counter and optionally skip this visualization
@@ -143,8 +166,9 @@ class VisualizePolicyCallback:
                 cumulative_reward += step_reward
                 
                 # Store reward components for visualization
+                components_dict = self._reward_components_to_dict(state.info["reward_components"]) 
                 reward_info_list.append({
-                    "components": {k: float(v) for k, v in state.info["reward_components"].items()},
+                    "components": components_dict,
                     "step_reward": step_reward,
                     "cumulative_reward": cumulative_reward
                 })
@@ -257,7 +281,7 @@ class VisualizePolicyCallback:
             # `ctrl_dt` to get the true time per frame.
             dt_frame = float(self.env._config.ctrl_dt)
             fps = float(1.0 / dt_frame)
-            ani_save_dir = self.script_dir / "simulation" / f"{self.train_id}"
+            ani_save_dir = self.script_dir / "simulation" / f"{self.train_id}" / "test"
             ani_save_dir.mkdir(parents=True, exist_ok=True)
 
             fig, ax = plt.subplots()

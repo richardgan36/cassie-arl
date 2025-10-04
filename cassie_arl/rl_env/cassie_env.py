@@ -50,7 +50,7 @@ def default_config() -> config_dict.ConfigDict:
         # Required simulation parameters
         # --------------------------------
         ctrl_dt=0.02,
-        sim_dt=0.001,  # Match "timestep" in MJCF
+        sim_dt=0.002,  # Match "timestep" in MJCF
         episode_length=500,  # 10 seconds at ctrl_dt=0.02
         history_len=1,
 
@@ -67,8 +67,8 @@ def default_config() -> config_dict.ConfigDict:
                 pelvis_lin_vel=-0.7,
                 pelvis_tilt=-0.5,
                 motor_ref_error=-0.6,
-                action_rate=-0.2,
-                torques=-0.1,
+                action_rate=-1.0,
+                torques=-0.3,
             ),
         )
     )
@@ -161,10 +161,6 @@ class CassieEnv(mjx_env.MjxEnv):
             # Keep reward components as a PyTree for JIT friendliness.
             "reward_components": RewardComponents.zeros(),
             "last_action": jnp.zeros((self.action_size,)),
-            # Whether the one-time "lift foot" reward has been granted
-            # "lift_foot_given": jnp.array(False),
-            # Previous foot contact information
-            # Last COM error when both feet were on ground
         }
 
         return mjx_env.State(
@@ -283,7 +279,6 @@ class CassieEnv(mjx_env.MjxEnv):
         """
         # TODO: IMPORTANT: need to reward active recovery strategies, not just standing still
         # TODO: look into selective/adaptive rewards e.g. lift costs for movement when perturbing robot
-        # TODO: cost for large torques
 
         # Split components into per-step (integrated over dt) and event (one-time) rewards.
         per_step = {
