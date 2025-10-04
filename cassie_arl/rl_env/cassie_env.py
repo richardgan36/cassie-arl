@@ -192,17 +192,17 @@ class CassieEnv(mjx_env.MjxEnv):
         Args:
             state: Current environment state.
             action: Action to take. Shape: [action_size], values in [-1, 1].
-                    Should be interpreted as normalized position targets for
+                    Should be interpreted as normalized deltas for
                     the 10 actuated joints.
         """
         rng = state.info["rng"]
 
         action = jnp.clip(action, -1.0, 1.0)
 
-        pos_targets = self._action2pos_targets(action)
+        pos_errors = self._action2pos_errors(action)
         torques = self._pd_control(
             state.data,
-            pos_targets,
+            pos_errors,
             self._p_gain,
             self._d_gain
         )
@@ -397,21 +397,34 @@ class CassieEnv(mjx_env.MjxEnv):
         
         return jnp.logical_or(left_hit, right_hit)
 
+    def _action2pos_errors(self, action: jax.Array) -> jax.Array:
+        """
+        Scales normalized actions [-1, 1] to deltas of motor joint angles.
+
+        The action is interpreted as normalized deltas of the 10 actuated
+        joints from the standing pose angles. The scaling consists of a
+        piecewise linear mapping:
+            [-1, 0] -> [soft lower limit delta, 0]
+            [ 0, 1] -> [0, soft upper limit delta]
+        """
+        s_pos = self._jnt_soft_uppers - self._standing_jnt_angles   # Positive side span
+        s_neg = self._standing_jnt_angles - self._jnt_soft_lowers   # Negative side span
+        return 0.5 * (s_pos + s_neg) * action + 0.5 * (s_pos - s_neg) * jnp.abs(action)
+
     def _pd_control(
             self,
             data: mjx.Data,
-            pos_targets: jax.Array,
+            pos_error: jax.Array,
             p_gain: jax.Array,
             d_gain: jax.Array,
     ) -> jax.Array:
-        """Computes PD control torques for the actuated joints."""
+        """Computes PD control torques for the actuated joints using deltas."""
         # Current motor positions and velocities
-        motor_qpos = data.qpos[QPosIdx.MOTORS]
         motor_qvel = data.qvel[QVelIdx.MOTORS]
 
         # PD control
-        pos_err = pos_targets - motor_qpos
-        vel_err = -motor_qvel  # Target vel is zero
+        vel_error = -motor_qvel  # Target vel is zero
 
-        torques = p_gain * pos_err + d_gain * vel_err + self._standing_torques
+        torques = p_gain * pos_error + d_gain * vel_error + self._standing_torques
         return jnp.clip(torques, self._torque_lowers, self._torque_uppers)
+    
