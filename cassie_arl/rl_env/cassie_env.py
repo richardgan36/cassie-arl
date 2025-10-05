@@ -11,6 +11,7 @@ from mujoco_playground._src import mjx_env
 
 from cassie_arl.config.cassie_consts import *
 import cassie_arl.rl_env.math_utils as math_utils
+from cassie_arl.rl_env.butterworth import BiquadFilter, design_butterworth_biquad
 
 
 script_dir = Path(__file__).parent
@@ -44,6 +45,7 @@ class RewardComponents:
         )
 
 
+
 def default_config() -> config_dict.ConfigDict:
     return config_dict.create(
         # --------------------------------
@@ -58,28 +60,44 @@ def default_config() -> config_dict.ConfigDict:
         # Custom parameters
         # -------------------
 
+        soft_joint_pos_limit_factors=0.95,  # Fraction of full range to use as soft limits on actuated joints
+
         # PD Gains
+        # p_gain = jnp.array([
+        #     8, 4, 4, 10, 0.4,
+        #     8, 4, 4, 10, 0.4
+        # ]),
+        # d_gain = jnp.array([
+        #     0.08, 0.08, 0.2, 0.4, 0.08,
+        #     0.08, 0.08, 0.2, 0.4, 0.08
+        # ]),
         p_gain = jnp.array([
             8, 4, 4, 10, 0.4,
             8, 4, 4, 10, 0.4
-        ]),
+        ]) / 5,
         d_gain = jnp.array([
             0.08, 0.08, 0.2, 0.4, 0.08,
             0.08, 0.08, 0.2, 0.4, 0.08
-        ]),
+        ]) / 5,
+
 
         # Reward function configuration
         # Except for the "fall" cost, which is a one-time cost, all reward weights
         # are in [0, 1] and all cost weights are in [-1, 0].
         reward_config=config_dict.create(
             scales=config_dict.create(
-                alive=1.5,
+                alive=2.0,
                 pelvis_lin_vel=-0.7,
-                pelvis_tilt=-0.5,
+                pelvis_tilt=-0.6,
                 motor_ref_error=-0.7,
-                action_rate=-0.8,
+                action_rate=-0.6,
                 torques=-0.3,
             ),
+        ),
+
+        filters=config_dict.create(
+            vel_cutoff_hz=25.0,    # Hz for measured joint velocity filtering
+            target_cutoff_hz=10.0, # Hz for target joint angle smoothing
         )
     )
 
@@ -115,6 +133,14 @@ class CassieEnv(mjx_env.MjxEnv):
         standing_quat = self._init_qpos[QPosIdx.BASE_QUAT]
         self._standing_base_rpy = math_utils.quat2euler(standing_quat)
 
+        # Apply soft limits on actuated joints for safe hardware deployment
+        self._jnt_lowers = jnp.array(self._mj_model.jnt_range[JntRangeIdx.MOTORS, 0])
+        self._jnt_uppers = jnp.array(self._mj_model.jnt_range[JntRangeIdx.MOTORS, 1])
+        jnt_c = (self._jnt_lowers + self._jnt_uppers) / 2
+        jnt_r = self._jnt_uppers - self._jnt_lowers
+        self._jnt_soft_lowers = jnt_c - 0.5 * jnt_r * self._config.soft_joint_pos_limit_factors
+        self._jnt_soft_uppers = jnt_c + 0.5 * jnt_r * self._config.soft_joint_pos_limit_factors
+
         self._torque_lowers = jnp.array(self._mj_model.actuator_ctrlrange[:, 0])
         self._torque_uppers = jnp.array(self._mj_model.actuator_ctrlrange[:, 1])
 
@@ -138,6 +164,29 @@ class CassieEnv(mjx_env.MjxEnv):
         # PD gains
         self._p_gain = self._config.p_gain
         self._d_gain = self._config.d_gain
+
+        # -------------------
+        # Butterworth filter setup
+        # -------------------
+        self._ctrl_rate_hz = 1.0 / self.dt
+
+        # Butterworth filter for qvel
+        self._vel_filter = BiquadFilter.create(
+            design_butterworth_biquad(
+                self._config.filters.vel_cutoff_hz,
+                self._ctrl_rate_hz
+            ),
+            self.action_size
+        )
+
+        # Butterworth filter for target joint angles
+        self._target_filter = BiquadFilter.create(
+            design_butterworth_biquad(
+                self._config.filters.target_cutoff_hz,
+                self._ctrl_rate_hz
+            ),
+            self.action_size
+        )
 
     # ----------------------------------------------------------------------
     # Required abstract methods/properties
@@ -178,6 +227,10 @@ class CassieEnv(mjx_env.MjxEnv):
             # Keep reward components as a PyTree for JIT friendliness.
             "reward_components": RewardComponents.zeros(),
             "last_action": jnp.zeros((self.action_size,)),
+            "last_torques": jnp.zeros((self.action_size,)),
+            # Filter states
+            "vel_filter": self._vel_filter,
+            "target_filter": self._target_filter,
         }
 
         return mjx_env.State(
@@ -203,13 +256,24 @@ class CassieEnv(mjx_env.MjxEnv):
 
         action = jnp.clip(action, -1.0, 1.0)
 
-        pos_errors = self._action2pos_errors(action)
-        torques = self._pd_control(
+        # 1. Convert action to raw joint position targets (vector length 10)
+        raw_pos_targets = self._action_to_jnt_targets(action)
+
+        # 2. Filter targets (for smoother commanded motion)
+        target_filter = state.info["target_filter"]
+        filtered_targets, new_target_filter = target_filter.apply(raw_pos_targets)
+
+        # 3. PD control with filtered velocities
+        # We'll pass filter state so _pd_control can update it.
+        torques, new_vel_filter = self._pd_control(
             state.data,
-            pos_errors,
+            filtered_targets,
             self._p_gain,
-            self._d_gain
+            self._d_gain,
+            state.info["vel_filter"],
         )
+        torques = self._limit_torque_rate(torques, state.info["last_torques"])
+        torques = jnp.clip(torques, self._torque_lowers, self._torque_uppers)
 
         data = mjx_env.step(
             self._mjx_model, state.data, torques, self.n_substeps
@@ -219,7 +283,12 @@ class CassieEnv(mjx_env.MjxEnv):
 
         # Get reward components. `_get_reward` returns ((per_step_raw, event_raw), (lift_given_new, current_both_feet, current_com_error))
         # (per_step_raw, event_raw), (lift_given_new, current_both_feet, current_com_error) = self._get_reward(data, action, state.info)
-        per_step_raw = self._get_reward(data, action, state.info)
+        per_step_raw = self._get_reward(
+                            data,
+                            action,
+                            state.info,
+                            torques
+                        )
 
         # Scale each component by its configured weight
         per_step_scaled = {k: per_step_raw[k] * self._config.reward_config.scales[k] for k in per_step_raw}
@@ -240,6 +309,9 @@ class CassieEnv(mjx_env.MjxEnv):
             # Store reward components as a PyTree for stability under JIT.
             "reward_components": RewardComponents(**per_step_scaled),
             "last_action": action,  # For action rate cost
+            "last_torques": torques,  # For torque rate limiting
+            "vel_filter": new_vel_filter,
+            "target_filter": new_target_filter,
         }
         return state.replace(
             data=data,
@@ -288,7 +360,8 @@ class CassieEnv(mjx_env.MjxEnv):
             self,
             data: mjx.Data,
             action: jax.Array,
-            info: Dict[str, Any]
+            info: Dict[str, Any],
+            torques: jax.Array
         ) -> Dict[str, jax.Array]:
         """
         Computes reward components.
@@ -306,7 +379,7 @@ class CassieEnv(mjx_env.MjxEnv):
             "pelvis_tilt": self._cost_pelvis_tilt(data),
             "motor_ref_error": self._cost_motor_reference_error(data),
             "action_rate": self._cost_action_rate(action, info["last_action"]),
-            "torques": self._cost_torques(action),
+            "torques": self._cost_torques(torques),
         }
 
         return per_step
@@ -348,19 +421,18 @@ class CassieEnv(mjx_env.MjxEnv):
         return jnp.clip(cost, 0.0, 1.0)
 
     def _cost_action_rate(self, action: jax.Array, last_action: jax.Array) -> jax.Array:
-        """Cost for large changes in action (torque) between steps."""
+        """Cost for large changes in action between steps."""
         # If action moves through the full range in quarter of a second, incur max cost.
         act_rate = action - last_action
         rate_scale = 8.0 * self.dt  # Normalizing constant
         cost = jnp.mean((act_rate / rate_scale)**2)
         return jnp.clip(cost, 0.0, 1.0)
     
-    def _cost_torques(self, action: jax.Array) -> jax.Array:
+    def _cost_torques(self, torques: jax.Array) -> jax.Array:
         """Cost for large torques."""
-        # Use the normalized action as a proxy for torque
         # Incur max cost if using max torque
-        torque_scale = 1.0  # Normalizing constant
-        cost = jnp.mean((action / torque_scale)**2)
+        torque_scales = self._torque_uppers  # Normalizing constant
+        cost = jnp.mean((torques / torque_scales)**2)
         return jnp.clip(cost, 0.0, 1.0)
 
     def _get_termination(self, data: mjx.Data, step: jax.Array) -> jax.Array:
@@ -401,34 +473,51 @@ class CassieEnv(mjx_env.MjxEnv):
         
         return jnp.logical_or(left_hit, right_hit)
 
-    def _action2pos_errors(self, action: jax.Array) -> jax.Array:
+    def _action_to_jnt_targets(self, action: jax.Array) -> jax.Array:
         """
-        Scales normalized actions [-1, 1] to deltas of motor joint angles.
+        Scales normalized actions [-1, 1] to motor joint angles.
 
         The action is interpreted as normalized deltas of the 10 actuated
         joints from the standing pose angles. The scaling consists of a
         piecewise linear mapping:
-            [-1, 0] -> [soft lower limit delta, 0]
-            [ 0, 1] -> [0, soft upper limit delta]
+            [-1, 0] -> [soft lower joint limit, standing angle]
+            [ 0, 1] -> [standing angle, soft upper joint limit]
         """
         s_pos = self._jnt_soft_uppers - self._standing_jnt_angles   # Positive side span
         s_neg = self._standing_jnt_angles - self._jnt_soft_lowers   # Negative side span
-        return 0.5 * (s_pos + s_neg) * action + 0.5 * (s_pos - s_neg) * jnp.abs(action)
+        return self._standing_jnt_angles + 0.5 * (s_pos + s_neg) * action + 0.5 * (s_pos - s_neg) * jnp.abs(action)
 
     def _pd_control(
             self,
             data: mjx.Data,
-            pos_error: jax.Array,
+            pos_targets: jax.Array,
             p_gain: jax.Array,
             d_gain: jax.Array,
+        vel_filter_state: BiquadFilter | None,
     ) -> jax.Array:
-        """Computes PD control torques for the actuated joints using deltas."""
-        # Current motor positions and velocities
-        motor_qvel = data.qvel[QVelIdx.MOTORS]
+        """Computes PD control torques with optional velocity low-pass filtering.
 
-        # PD control
-        vel_error = -motor_qvel  # Target vel is zero
+        Returns tuple (torques, new_vel_filter_state) if velocity filter enabled, else (torques, vel_filter_state).
+        """
+        motor_qpos = data.qpos[QPosIdx.MOTORS]
+        raw_motor_qvel = data.qvel[QVelIdx.MOTORS]
+
+        # Filter the noisy velocity
+        filt_vel, new_state = vel_filter_state.apply(raw_motor_qvel)
+
+        pos_error = pos_targets - motor_qpos
+        vel_error = -filt_vel  # Desire zero vel
 
         torques = p_gain * pos_error + d_gain * vel_error + self._standing_torques
-        return jnp.clip(torques, self._torque_lowers, self._torque_uppers)
+        return torques, new_state
+    
+    def _limit_torque_rate(
+            self,
+            torques: jax.Array,
+            last_torques: jax.Array
+        ) -> jax.Array:
+        """Clips torques if changes by more than the max torque rate."""
+        max_torque_rate = (self._torque_uppers - self._torque_lowers) * 2  # Moves through the full range in 0.5 seconds
+        max_delta = max_torque_rate * self.dt
+        return jnp.clip(torques, last_torques - max_delta, last_torques + max_delta)
     
