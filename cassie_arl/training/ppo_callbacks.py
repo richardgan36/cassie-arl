@@ -109,8 +109,9 @@ class VisualizePolicyCallback:
         foot_infos: List['VisualizePolicyCallback.FootInfo'] = field(default_factory=list)
         torque_history: List[np.ndarray] = field(default_factory=list)  # (T, 10)
         angle_delta_history: List[np.ndarray] = field(default_factory=list)  # (T, 10)
-        raw_qvel_history: List[np.ndarray] = field(default_factory=list)  # (T, 10) raw motor velocities
-        filt_qvel_history: List[np.ndarray] = field(default_factory=list)  # (T, 10) filtered motor velocities
+        motor_qpos_history: List[np.ndarray] = field(default_factory=list)  # (T, 10) actual joint angles AFTER step
+        raw_target_history: List[np.ndarray] = field(default_factory=list)  # (T, 10) unfiltered PD targets BEFORE step
+        filt_target_history: List[np.ndarray] = field(default_factory=list)  # (T, 10) filtered PD targets BEFORE step
         cumulative_reward: float = 0.0
 
     # ------------------------------- Init ----------------------------------------
@@ -196,37 +197,25 @@ class VisualizePolicyCallback:
 
         for _ in range(self.env._config.episode_length):
             act_rng, rng = jax.random.split(rng)
-            ctrl, _ = inference_fn(state.obs, act_rng)
-
-            # --- Reproduce env.step path (custom PD) ---
-            raw_pos_targets = self.env._action_to_jnt_targets(ctrl)
-            target_filter = state.info["target_filter"]
-            filtered_targets, new_target_filter = target_filter.apply(raw_pos_targets)
-            # Re-implement PD control locally so we can capture raw + filtered velocities
-            motor_qpos = state.data.qpos[QPosIdx.MOTORS]
-            raw_motor_qvel = state.data.qvel[QVelIdx.MOTORS]
-            vel_filter_state = state.info["vel_filter"]
-            filt_vel, new_vel_filter = vel_filter_state.apply(raw_motor_qvel)
-            pos_error = filtered_targets - motor_qpos
-            vel_error = -filt_vel
-            torque = self.env._p_gain * pos_error + self.env._d_gain * vel_error + self.env._standing_torques
-            torque = self.env._limit_torque_rate(torque, state.info["last_torques"])  # type: ignore
-            torque = jnp.clip(torque, self.env._torque_lowers, self.env._torque_uppers)  # type: ignore
-
-            state = self.jit_step(state, torque)
-            state.info["last_action"] = ctrl
-            state.info["last_torques"] = torque
-            state.info["vel_filter"] = new_vel_filter
-            state.info["target_filter"] = new_target_filter
+            action, _ = inference_fn(state.obs, act_rng)
+            # Let the environment perform its own PD + filtering; pass raw action
+            state = self.jit_step(state, action)
 
             if bool(state.done):
                 break
 
             # --- Collect per-step diagnostics ---
             data.traj.append(state)
-            data.torque_history.append(np.array(torque))
-            data.raw_qvel_history.append(np.array(raw_motor_qvel))
-            data.filt_qvel_history.append(np.array(filt_vel))
+            # Torques come from info (after env.step). If not present, skip.
+            if "last_torques" in state.info:
+                data.torque_history.append(np.array(state.info["last_torques"]))
+            # Store targets used for this control step (raw + filtered) and resulting joint angles AFTER physics step
+            motor_qpos_new = state.data.qpos[QPosIdx.MOTORS]
+            data.motor_qpos_history.append(np.array(motor_qpos_new))
+            if "raw_pos_targets" in state.info:
+                data.raw_target_history.append(np.array(state.info["raw_pos_targets"]))
+            if "filtered_pos_targets" in state.info:
+                data.filt_target_history.append(np.array(state.info["filtered_pos_targets"]))
             self._maybe_record_angle_deltas(state, data)
             self._record_reward(state, data)
             self._record_feet(state, data)
@@ -265,7 +254,14 @@ class VisualizePolicyCallback:
         # Plots
         self._plot_torques(rollout.torque_history, base_name, ani_save_dir, dt_frame)
         self._plot_angle_deltas(rollout.angle_delta_history, base_name, ani_save_dir, dt_frame)
-        self._plot_qvels(rollout.raw_qvel_history, rollout.filt_qvel_history, base_name, ani_save_dir, dt_frame)
+        self._plot_joint_angles(
+            rollout.motor_qpos_history,
+            rollout.raw_target_history,
+            rollout.filt_target_history,
+            base_name,
+            ani_save_dir,
+            dt_frame,
+        )
         logging.info(f"Saved rollout video to {ani_save_path}")
 
     def _render_frames(self, traj: List[Any]):
@@ -328,7 +324,7 @@ class VisualizePolicyCallback:
     def _save_video(self, current_step: int, frames_overlay: List[np.ndarray]):
         dt_frame = float(self.env._config.ctrl_dt)
         fps = float(1.0 / dt_frame)
-        ani_save_dir = self.script_dir / "simulation" / f"{self.train_id}" / "test"
+        ani_save_dir = self.script_dir / "simulation" / f"{self.train_id}"
         ani_save_dir.mkdir(parents=True, exist_ok=True)
         fig, ax = plt.subplots()
         ax.axis("off")
@@ -418,53 +414,65 @@ class VisualizePolicyCallback:
         except Exception as e:
             logging.exception(f"Failed generating/saving joint angle delta montage: {e}")
 
-    def _plot_qvels(
+    def _plot_joint_angles(
         self,
-        raw_qvel_history: List[np.ndarray],
-        filt_qvel_history: List[np.ndarray],
+        motor_qpos_history: List[np.ndarray],
+        raw_target_history: List[np.ndarray],
+        filt_target_history: List[np.ndarray],
         base_name: str,
         save_dir: Path,
         dt_frame: float,
     ):
-        """Plot raw vs filtered joint velocities over the rollout."""
-        if len(raw_qvel_history) == 0 or len(filt_qvel_history) == 0:
-            logging.warning("No joint velocity data collected; episode ended before first step?")
+        """Plot actual joint angles and PD targets (raw + filtered).
+
+        The targets are the ones used to compute torques for each control step;
+        actual joint angles are sampled AFTER the physics integration.
+        """
+        if len(motor_qpos_history) == 0:
+            logging.warning("No joint angle data collected; episode ended before first step?")
             return
         try:
-            raw_arr = np.stack(raw_qvel_history, axis=0)  # (T, 10)
-            filt_arr = np.stack(filt_qvel_history, axis=0)  # (T, 10)
-            T = raw_arr.shape[0]
+            actual_arr = np.stack(motor_qpos_history, axis=0)  # (T, 10)
+            raw_arr = np.stack(raw_target_history, axis=0) if len(raw_target_history) == len(motor_qpos_history) else None
+            filt_arr = np.stack(filt_target_history, axis=0) if len(filt_target_history) == len(motor_qpos_history) else None
+            T = actual_arr.shape[0]
             time_axis = np.arange(T) * dt_frame
             rows, cols = 5, 2
-            fig_v, axes_v = plt.subplots(rows, cols, figsize=(cols * 6, rows * 3), sharex=True)
-            axes_fv = axes_v.flatten()
+            fig_j, axes_j = plt.subplots(rows, cols, figsize=(cols * 6, rows * 3), sharex=True)
+            axes_fj = axes_j.flatten()
             joint_names = [
                 "Left Hip Roll", "Left Hip Yaw", "Left Hip Pitch", "Left Knee", "Left Foot",
                 "Right Hip Roll", "Right Hip Yaw", "Right Hip Pitch", "Right Knee", "Right Foot"
             ]
             for row, j in enumerate(range(0, 5)):
-                ax_left = axes_fv[row * cols]
-                ax_left.plot(time_axis, raw_arr[:, j], color='lightcoral', linewidth=0.9, label='Raw')
-                ax_left.plot(time_axis, filt_arr[:, j], color='tab:green', linewidth=1.2, label='Filtered')
+                ax_left = axes_fj[row * cols]
+                ax_left.plot(time_axis, actual_arr[:, j], color='tab:blue', linewidth=1.4, label='Actual')
+                if raw_arr is not None:
+                    ax_left.plot(time_axis, raw_arr[:, j], color='orange', linewidth=1.0, linestyle='--', label='Target Raw')
+                if filt_arr is not None:
+                    ax_left.plot(time_axis, filt_arr[:, j], color='tab:green', linewidth=1.2, label='Target Filtered')
                 ax_left.set_title(joint_names[j])
-                ax_left.set_ylabel('qvel (rad/s)')
+                ax_left.set_ylabel('Angle (rad)')
                 ax_left.grid(alpha=0.3)
                 if row == 0:
-                    ax_left.legend(frameon=False, fontsize=8)
+                    ax_left.legend(frameon=False, fontsize=8, ncol=3, loc='upper right')
             for row, j in enumerate(range(5, 10)):
-                ax_right = axes_fv[row * cols + 1]
-                ax_right.plot(time_axis, raw_arr[:, j], color='lightcoral', linewidth=0.9, label='Raw')
-                ax_right.plot(time_axis, filt_arr[:, j], color='tab:green', linewidth=1.2, label='Filtered')
+                ax_right = axes_fj[row * cols + 1]
+                ax_right.plot(time_axis, actual_arr[:, j], color='tab:blue', linewidth=1.4, label='Actual')
+                if raw_arr is not None:
+                    ax_right.plot(time_axis, raw_arr[:, j], color='orange', linewidth=1.0, linestyle='--', label='Target Raw')
+                if filt_arr is not None:
+                    ax_right.plot(time_axis, filt_arr[:, j], color='tab:green', linewidth=1.2, label='Target Filtered')
                 ax_right.set_title(joint_names[j])
                 ax_right.grid(alpha=0.3)
-            axes_fv[8].set_xlabel('Time (s)')
-            axes_fv[9].set_xlabel('Time (s)')
-            fig_v.suptitle('Joint Velocities (Raw vs Filtered)')
-            fig_v.tight_layout(rect=[0, 0, 1, 0.96])
-            qvel_plot_path = save_dir / f"{base_name}_qvels.png"
-            fig_v.savefig(qvel_plot_path, dpi=160)
-            plt.close(fig_v)
-            logging.info(f"Saved joint velocity montage to {qvel_plot_path}")
+            axes_fj[8].set_xlabel('Time (s)')
+            axes_fj[9].set_xlabel('Time (s)')
+            fig_j.suptitle('Joint Angles: Actual vs PD Targets (Raw & Filtered)')
+            fig_j.tight_layout(rect=[0, 0, 1, 0.96])
+            joint_plot_path = save_dir / f"{base_name}_joint_angles.png"
+            fig_j.savefig(joint_plot_path, dpi=160)
+            plt.close(fig_j)
+            logging.info(f"Saved joint angle montage to {joint_plot_path}")
         except Exception as e:
-            logging.exception(f"Failed generating/saving joint velocity montage: {e}")
+            logging.exception(f"Failed generating/saving joint angle montage: {e}")
 

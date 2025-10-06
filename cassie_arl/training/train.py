@@ -32,12 +32,12 @@ ppo_training_params = {
     'clipping_epsilon': 0.2,
     'discounting': 0.97,  # TODO: Used to be 0.97. Change back?
     'entropy_cost': 0.005,  # Increased initially to encourage exploration. TODO: anneal down to 0?
-    'episode_length': 1024,
+    'episode_length': 512,
     'learning_rate': 3e-4,  # Was 3e-4
     'max_grad_norm': 1.0,
     'normalize_observations': True,
     'num_envs': 8192,
-    'num_evals': 20,
+    'num_evals': 25,
     'num_minibatches': 32,
     'num_resets_per_eval': 1,
     'num_timesteps': 150_000_000,
@@ -47,7 +47,7 @@ ppo_training_params = {
     'restore_value_fn': True,
 }
 
-train_id = "cassie_find_eq_torques_5"  # This training is purely to find the torques required to hold the standing pose
+train_id = "try_pd_3"  # Try to use PD control
 env = CassieEnv()
 
 # JIT-wrapped env functions kept as local variables and passed into the visualization callback
@@ -62,23 +62,23 @@ network_factory = functools.partial(
     **dict(network_factory_params)
 )
 
-# --- Shorten training for testing ---
-ppo_training_params["num_evals"] = 1
-ppo_training_params["episode_length"] = 5
-ppo_training_params["num_envs"] = 1
-ppo_training_params["num_minibatches"] = 4
-ppo_training_params["batch_size"] = 2
-ppo_training_params["unroll_length"] = 8
-ppo_training_params["num_timesteps"] = 100
+# # --- Shorten training for testing ---
+# ppo_training_params["num_evals"] = 1
+# ppo_training_params["episode_length"] = 5
+# ppo_training_params["num_envs"] = 1
+# ppo_training_params["num_minibatches"] = 4
+# ppo_training_params["batch_size"] = 2
+# ppo_training_params["unroll_length"] = 8
+# ppo_training_params["num_timesteps"] = 100
 
 logging.info("PPO training parameters:")
 logging.info(ppo_training_params)
 
 save_ckpt_dir = script_dir / "checkpoints" / f"{train_id}"
-restore_ckpt_path = script_dir / "checkpoints/cassie_find_eq_torques_5/000024084480"
+# restore_ckpt_path = script_dir / "checkpoints/try_pd/000048168960"
 
 # Instantiate callback objects
-progress_cb = ProgressCallback(ppo_training_params, script_dir, train_id, save_plot=False)
+progress_cb = ProgressCallback(ppo_training_params, script_dir, train_id, save_plot=True)
 viz_cb = VisualizePolicyCallback(env, jit_reset, jit_step, script_dir, train_id, run_every_n_calls=1)
 
 train_fn = functools.partial(
@@ -87,8 +87,8 @@ train_fn = functools.partial(
     randomization_fn=randomizer,
     progress_fn=progress_cb,
     policy_params_fn=viz_cb,
-    # save_checkpoint_path=save_ckpt_dir.as_posix(),
-    restore_checkpoint_path=restore_ckpt_path.as_posix()
+    save_checkpoint_path=save_ckpt_dir.as_posix(),
+    # restore_checkpoint_path=restore_ckpt_path.as_posix()
 )
 
 if "save_checkpoint_path" in train_fn.keywords:

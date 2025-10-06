@@ -6,7 +6,8 @@ import jax.numpy as jnp
 
 @struct.dataclass
 class BiquadFilter:
-    """Second-order (biquad) low-pass Butterworth filter (vectorized).
+    """
+    Second-order (biquad) low-pass Butterworth filter (vectorized).
 
     Coefficients are scalars (broadcast) and state arrays are shape (n_channels,).
     Difference equation (a0=1):
@@ -40,7 +41,8 @@ class BiquadFilter:
 
 
 def design_butterworth_biquad(fc_hz: float, fs_hz: float):
-    """Design 2nd-order Butterworth low-pass biquad.
+    """
+    Design 2nd-order Butterworth low-pass biquad.
 
     Returns tuple (b0,b1,b2,a1,a2) for use with difference equation (a0=1).
     Uses bilinear transform; fc_hz < fs_hz/2.

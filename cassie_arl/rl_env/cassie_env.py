@@ -87,17 +87,16 @@ def default_config() -> config_dict.ConfigDict:
         reward_config=config_dict.create(
             scales=config_dict.create(
                 alive=2.0,
-                pelvis_lin_vel=-0.7,
-                pelvis_tilt=-0.6,
+                pelvis_lin_vel=-0.6,
+                pelvis_tilt=-0.7,
                 motor_ref_error=-0.7,
-                action_rate=-0.6,
+                action_rate=-0.4,
                 torques=-0.3,
             ),
         ),
 
         filters=config_dict.create(
-            vel_cutoff_hz=25.0,    # Hz for measured joint velocity filtering
-            target_cutoff_hz=10.0, # Hz for target joint angle smoothing
+            target_cutoff_hz=6.0,  # Hz for target joint angle smoothing
         )
     )
 
@@ -170,15 +169,6 @@ class CassieEnv(mjx_env.MjxEnv):
         # -------------------
         self._ctrl_rate_hz = 1.0 / self.dt
 
-        # Butterworth filter for qvel
-        self._vel_filter = BiquadFilter.create(
-            design_butterworth_biquad(
-                self._config.filters.vel_cutoff_hz,
-                self._ctrl_rate_hz
-            ),
-            self.action_size
-        )
-
         # Butterworth filter for target joint angles
         self._target_filter = BiquadFilter.create(
             design_butterworth_biquad(
@@ -229,8 +219,9 @@ class CassieEnv(mjx_env.MjxEnv):
             "last_action": jnp.zeros((self.action_size,)),
             "last_torques": jnp.zeros((self.action_size,)),
             # Filter states
-            "vel_filter": self._vel_filter,
             "target_filter": self._target_filter,
+            "raw_pos_targets": jnp.zeros((self.action_size,)),
+            "filtered_pos_targets": jnp.zeros((self.action_size,)),
         }
 
         return mjx_env.State(
@@ -265,12 +256,11 @@ class CassieEnv(mjx_env.MjxEnv):
 
         # 3. PD control with filtered velocities
         # We'll pass filter state so _pd_control can update it.
-        torques, new_vel_filter = self._pd_control(
+        torques = self._pd_control(
             state.data,
             filtered_targets,
             self._p_gain,
             self._d_gain,
-            state.info["vel_filter"],
         )
         torques = self._limit_torque_rate(torques, state.info["last_torques"])
         torques = jnp.clip(torques, self._torque_lowers, self._torque_uppers)
@@ -310,8 +300,9 @@ class CassieEnv(mjx_env.MjxEnv):
             "reward_components": RewardComponents(**per_step_scaled),
             "last_action": action,  # For action rate cost
             "last_torques": torques,  # For torque rate limiting
-            "vel_filter": new_vel_filter,
             "target_filter": new_target_filter,
+            "raw_pos_targets": raw_pos_targets,
+            "filtered_pos_targets": filtered_targets,
         }
         return state.replace(
             data=data,
@@ -493,23 +484,14 @@ class CassieEnv(mjx_env.MjxEnv):
             pos_targets: jax.Array,
             p_gain: jax.Array,
             d_gain: jax.Array,
-        vel_filter_state: BiquadFilter | None,
     ) -> jax.Array:
-        """Computes PD control torques with optional velocity low-pass filtering.
-
-        Returns tuple (torques, new_vel_filter_state) if velocity filter enabled, else (torques, vel_filter_state).
-        """
+        """Computes PD control torques."""
         motor_qpos = data.qpos[QPosIdx.MOTORS]
         raw_motor_qvel = data.qvel[QVelIdx.MOTORS]
-
-        # Filter the noisy velocity
-        filt_vel, new_state = vel_filter_state.apply(raw_motor_qvel)
-
         pos_error = pos_targets - motor_qpos
-        vel_error = -filt_vel  # Desire zero vel
-
+        vel_error = -raw_motor_qvel  # desire zero velocity
         torques = p_gain * pos_error + d_gain * vel_error + self._standing_torques
-        return torques, new_state
+        return torques
     
     def _limit_torque_rate(
             self,
@@ -517,7 +499,7 @@ class CassieEnv(mjx_env.MjxEnv):
             last_torques: jax.Array
         ) -> jax.Array:
         """Clips torques if changes by more than the max torque rate."""
-        max_torque_rate = (self._torque_uppers - self._torque_lowers) * 2  # Moves through the full range in 0.5 seconds
+        max_torque_rate = (self._torque_uppers - self._torque_lowers) / 0.6  # Moves through the full range in 0.6 seconds
         max_delta = max_torque_rate * self.dt
         return jnp.clip(torques, last_torques - max_delta, last_torques + max_delta)
     
