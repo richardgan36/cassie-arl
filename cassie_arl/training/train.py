@@ -47,7 +47,7 @@ ppo_training_params = {
     'restore_value_fn': True,
 }
 
-train_id = "try_pd_3"  # Try to use PD control
+train_id = "test_tune_pd"  # Try to use PD control
 env = CassieEnv()
 
 # JIT-wrapped env functions kept as local variables and passed into the visualization callback
@@ -62,33 +62,33 @@ network_factory = functools.partial(
     **dict(network_factory_params)
 )
 
-# # --- Shorten training for testing ---
-# ppo_training_params["num_evals"] = 1
-# ppo_training_params["episode_length"] = 5
-# ppo_training_params["num_envs"] = 1
-# ppo_training_params["num_minibatches"] = 4
-# ppo_training_params["batch_size"] = 2
-# ppo_training_params["unroll_length"] = 8
-# ppo_training_params["num_timesteps"] = 100
+# --- Shorten training for testing ---
+ppo_training_params["num_evals"] = 0
+ppo_training_params["episode_length"] = 5
+ppo_training_params["num_envs"] = 1
+ppo_training_params["num_minibatches"] = 4
+ppo_training_params["batch_size"] = 2
+ppo_training_params["unroll_length"] = 8
+ppo_training_params["num_timesteps"] = 100
 
 logging.info("PPO training parameters:")
 logging.info(ppo_training_params)
 
 save_ckpt_dir = script_dir / "checkpoints" / f"{train_id}"
-# restore_ckpt_path = script_dir / "checkpoints/try_pd/000048168960"
+restore_ckpt_path = script_dir / "checkpoints/try_pd_3/000083066880"
 
 # Instantiate callback objects
-progress_cb = ProgressCallback(ppo_training_params, script_dir, train_id, save_plot=True)
+progress_cb = ProgressCallback(ppo_training_params, script_dir, train_id, save_plot=False)
 viz_cb = VisualizePolicyCallback(env, jit_reset, jit_step, script_dir, train_id, run_every_n_calls=1)
 
 train_fn = functools.partial(
     ppo.train, **dict(ppo_training_params),
     network_factory=network_factory,
     randomization_fn=randomizer,
-    progress_fn=progress_cb,
+    # progress_fn=progress_cb,
     policy_params_fn=viz_cb,
-    save_checkpoint_path=save_ckpt_dir.as_posix(),
-    # restore_checkpoint_path=restore_ckpt_path.as_posix()
+    # save_checkpoint_path=save_ckpt_dir.as_posix(),
+    restore_checkpoint_path=restore_ckpt_path.as_posix()
 )
 
 if "save_checkpoint_path" in train_fn.keywords:

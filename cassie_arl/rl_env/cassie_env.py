@@ -72,13 +72,21 @@ def default_config() -> config_dict.ConfigDict:
         #     0.08, 0.08, 0.2, 0.4, 0.08
         # ]),
         p_gain = jnp.array([
-            8, 4, 4, 10, 0.4,
-            8, 4, 4, 10, 0.4
-        ]) / 5,
-        d_gain = jnp.array([
-            0.08, 0.08, 0.2, 0.4, 0.08,
-            0.08, 0.08, 0.2, 0.4, 0.08
-        ]) / 5,
+            8, 4, 4, 10, 1,
+            8, 4, 4, 10, 1
+        ]) / 4,
+        # d_gain = jnp.array([
+        #     0.08, 0.08, 0.2, 0.4, 0.08,
+        #     0.08, 0.08, 0.2, 0.4, 0.08
+        # ]) * 5,
+        d_gain = jnp.sqrt(jnp.array([  # Use rule of thumb Kd = 0.2 * sqrt(Kp)
+            8, 4, 4, 10, 1,
+            8, 4, 4, 10, 1
+        ]) / 4) * 0.2,
+        # d_gain = jnp.array([
+        #     0.0, 0.0, 0.0, 0.0, 0.0,
+        #     0.0, 0.0, 0.0, 0.0, 0.0
+        # ]),
 
 
         # Reward function configuration
