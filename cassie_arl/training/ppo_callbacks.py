@@ -108,10 +108,11 @@ class VisualizePolicyCallback:
         reward_records: List['VisualizePolicyCallback.RewardRecord'] = field(default_factory=list)
         foot_infos: List['VisualizePolicyCallback.FootInfo'] = field(default_factory=list)
         torque_history: List[np.ndarray] = field(default_factory=list)  # (T, 10)
-        angle_delta_history: List[np.ndarray] = field(default_factory=list)  # (T, 10)
+        actions_history: List[np.ndarray] = field(default_factory=list)  # (T, 10) first 10 action dims (normalized joint deltas)
         motor_qpos_history: List[np.ndarray] = field(default_factory=list)  # (T, 10) actual joint angles AFTER step
-        raw_target_history: List[np.ndarray] = field(default_factory=list)  # (T, 10) unfiltered PD targets BEFORE step
-        filt_target_history: List[np.ndarray] = field(default_factory=list)  # (T, 10) filtered PD targets BEFORE step
+        target_history: List[np.ndarray] = field(default_factory=list)  # (T, 10) PD position targets used for control
+        p_gain_history: List[np.ndarray] = field(default_factory=list)  # (T, 3) grouped Kp values (scaled)
+        d_gain_history: List[np.ndarray] = field(default_factory=list)  # (T, 3) grouped Kd values (scaled)
         cumulative_reward: float = 0.0
 
     # ------------------------------- Init ----------------------------------------
@@ -206,28 +207,34 @@ class VisualizePolicyCallback:
 
             # --- Collect per-step diagnostics ---
             data.traj.append(state)
-            # Torques come from info (after env.step). If not present, skip.
-            if "last_torques" in state.info:
-                data.torque_history.append(np.array(state.info["last_torques"]))
+            # Actions (first 10 dims are normalized joint deltas)
+            try:
+                nu = int(self.env.mjx_model.nu)
+                data.actions_history.append(np.array(action[:nu]))
+                # Record learned grouped PD gains (scaled to actual Kp/Kd)
+                p_raw = np.array(action[nu:nu+3])
+                d_raw = np.array(action[nu+3:nu+6])
+                p_scaled = (p_raw + 1.0) / 2.0 * float(self.env._config.max_p_gain)
+                d_scaled = (d_raw + 1.0) / 2.0 * float(self.env._config.max_d_gain)
+                data.p_gain_history.append(p_scaled)
+                data.d_gain_history.append(d_scaled)
+            except Exception:
+                pass
+            # Torques are included in the latest observation (last 10 dims of single obs)
+            try:
+                latest_obs = np.array(state.info["obs_history"][0])
+                nu = int(self.env.mjx_model.nu)
+                data.torque_history.append(latest_obs[-nu:])
+            except Exception:
+                pass
             # Store targets used for this control step (raw + filtered) and resulting joint angles AFTER physics step
             motor_qpos_new = state.data.qpos[QPosIdx.MOTORS]
             data.motor_qpos_history.append(np.array(motor_qpos_new))
-            if "raw_pos_targets" in state.info:
-                data.raw_target_history.append(np.array(state.info["raw_pos_targets"]))
-            if "filtered_pos_targets" in state.info:
-                data.filt_target_history.append(np.array(state.info["filtered_pos_targets"]))
-            self._maybe_record_angle_deltas(state, data)
+            if "pos_targets" in state.info:
+                data.target_history.append(np.array(state.info["pos_targets"]))
             self._record_reward(state, data)
             self._record_feet(state, data)
         return data
-
-    def _maybe_record_angle_deltas(self, state, data: 'VisualizePolicyCallback.RolloutData'):
-        try:
-            motor_delta = np.array(state.obs[5:15])
-            if motor_delta.shape[0] == 10:
-                data.angle_delta_history.append(motor_delta)
-        except Exception:
-            pass
 
     def _record_reward(self, state, data: 'VisualizePolicyCallback.RolloutData'):
         step_reward = float(state.reward)
@@ -253,11 +260,11 @@ class VisualizePolicyCallback:
         base_name, ani_save_dir, ani_save_path, dt_frame = self._save_video(current_step, frames_overlay)
         # Plots
         self._plot_torques(rollout.torque_history, base_name, ani_save_dir, dt_frame)
-        self._plot_angle_deltas(rollout.angle_delta_history, base_name, ani_save_dir, dt_frame)
+        self._plot_actions(rollout.actions_history, base_name, ani_save_dir, dt_frame)
+        self._plot_gains(rollout.p_gain_history, rollout.d_gain_history, base_name, ani_save_dir, dt_frame)
         self._plot_joint_angles(
             rollout.motor_qpos_history,
-            rollout.raw_target_history,
-            rollout.filt_target_history,
+            rollout.target_history,
             base_name,
             ani_save_dir,
             dt_frame,
@@ -378,13 +385,13 @@ class VisualizePolicyCallback:
         except Exception as e:
             logging.exception(f"Failed generating/saving torque montage: {e}")
 
-    def _plot_angle_deltas(self, angle_delta_history: List[np.ndarray], base_name: str, save_dir: Path, dt_frame: float):
-        if len(angle_delta_history) == 0:
-            logging.warning("No joint angle delta data collected; episode ended before first step?")
+    def _plot_actions(self, actions_history: List[np.ndarray], base_name: str, save_dir: Path, dt_frame: float):
+        if len(actions_history) == 0:
+            logging.warning("No action data collected; episode ended before first step?")
             return
         try:
-            angle_arr = np.stack(angle_delta_history, axis=0)
-            time_axis = np.arange(angle_arr.shape[0]) * dt_frame
+            act_arr = np.stack(actions_history, axis=0)
+            time_axis = np.arange(act_arr.shape[0]) * dt_frame
             rows, cols = 5, 2
             fig_a, axes_a = plt.subplots(rows, cols, figsize=(cols * 6, rows * 3), sharex=True)
             axes_fa = axes_a.flatten()
@@ -394,38 +401,84 @@ class VisualizePolicyCallback:
             ]
             for row, j in enumerate(range(0, 5)):
                 ax_left = axes_fa[row * cols]
-                ax_left.plot(time_axis, angle_arr[:, j], color='tab:blue', linewidth=1.2)
+                ax_left.plot(time_axis, act_arr[:, j], color='tab:orange', linewidth=1.2)
                 ax_left.set_title(joint_names[j])
-                ax_left.set_ylabel('Δ Angle (rad)')
+                ax_left.set_ylabel('Action (norm)')
+                ax_left.set_ylim([-1.05, 1.05])
                 ax_left.grid(alpha=0.3)
             for row, j in enumerate(range(5, 10)):
                 ax_right = axes_fa[row * cols + 1]
-                ax_right.plot(time_axis, angle_arr[:, j], color='tab:blue', linewidth=1.2)
+                ax_right.plot(time_axis, act_arr[:, j], color='tab:orange', linewidth=1.2)
                 ax_right.set_title(joint_names[j])
+                ax_right.set_ylim([-1.05, 1.05])
                 ax_right.grid(alpha=0.3)
             axes_fa[8].set_xlabel('Time (s)')
             axes_fa[9].set_xlabel('Time (s)')
-            fig_a.suptitle('Joint Angle Deltas (from observations)')
+            fig_a.suptitle('Normalized Joint Actions (first 10 dims)')
             fig_a.tight_layout(rect=[0, 0, 1, 0.96])
-            angles_plot_path = save_dir / f"{base_name}_angle_deltas.png"
-            fig_a.savefig(angles_plot_path, dpi=160)
+            actions_plot_path = save_dir / f"{base_name}_actions.png"
+            fig_a.savefig(actions_plot_path, dpi=160)
             plt.close(fig_a)
-            logging.info(f"Saved joint angle delta montage to {angles_plot_path}")
+            logging.info(f"Saved actions montage to {actions_plot_path}")
         except Exception as e:
-            logging.exception(f"Failed generating/saving joint angle delta montage: {e}")
+            logging.exception(f"Failed generating/saving actions montage: {e}")
 
-    def _plot_joint_angles(
+    def _plot_gains(
         self,
-        motor_qpos_history: List[np.ndarray],
-        raw_target_history: List[np.ndarray],
-        filt_target_history: List[np.ndarray],
+        p_gain_history: List[np.ndarray],
+        d_gain_history: List[np.ndarray],
         base_name: str,
         save_dir: Path,
         dt_frame: float,
     ):
-        """Plot actual joint angles and PD targets (raw + filtered).
+        if len(p_gain_history) == 0 or len(d_gain_history) == 0:
+            logging.warning("No PD gain data collected; episode ended before first step?")
+            return
+        try:
+            p_arr = np.stack(p_gain_history, axis=0)  # (T, 3)
+            d_arr = np.stack(d_gain_history, axis=0)  # (T, 3)
+            time_axis = np.arange(p_arr.shape[0]) * dt_frame
+            fig, (ax_p, ax_d) = plt.subplots(1, 2, figsize=(12, 4), sharex=True)
+            labels = ["Hip roll/yaw", "Hip pitch/knee", "Foot"]
+            colors = ['tab:blue', 'tab:green', 'tab:red']
+            # Plot Kp
+            for i in range(3):
+                ax_p.plot(time_axis, p_arr[:, i], label=labels[i], color=colors[i], linewidth=1.5)
+            ax_p.set_title('Learned Kp (grouped)')
+            ax_p.set_ylabel('Kp')
+            ax_p.set_xlabel('Time (s)')
+            ax_p.grid(alpha=0.3)
+            ax_p.set_ylim([0, float(self.env._config.max_p_gain) * 1.05])
+            ax_p.legend(frameon=False, fontsize=8)
+            # Plot Kd
+            for i in range(3):
+                ax_d.plot(time_axis, d_arr[:, i], label=labels[i], color=colors[i], linewidth=1.5)
+            ax_d.set_title('Learned Kd (grouped)')
+            ax_d.set_ylabel('Kd')
+            ax_d.set_xlabel('Time (s)')
+            ax_d.grid(alpha=0.3)
+            ax_d.set_ylim([0, float(self.env._config.max_d_gain) * 1.05])
+            # Only one legend is needed; keep it on Kp subplot
+            fig.suptitle('Learned PD Gains Over Time')
+            fig.tight_layout(rect=[0, 0, 1, 0.95])
+            gains_plot_path = save_dir / f"{base_name}_pd_gains.png"
+            fig.savefig(gains_plot_path, dpi=160)
+            plt.close(fig)
+            logging.info(f"Saved PD gains figure to {gains_plot_path}")
+        except Exception as e:
+            logging.exception(f"Failed generating/saving PD gains figure: {e}")
 
-        The targets are the ones used to compute torques for each control step;
+    def _plot_joint_angles(
+        self,
+        motor_qpos_history: List[np.ndarray],
+        target_history: List[np.ndarray],
+        base_name: str,
+        save_dir: Path,
+        dt_frame: float,
+    ):
+        """Plot actual joint angles and PD targets used for control.
+
+        Targets correspond to the per-step position targets the PD controller uses;
         actual joint angles are sampled AFTER the physics integration.
         """
         if len(motor_qpos_history) == 0:
@@ -433,8 +486,7 @@ class VisualizePolicyCallback:
             return
         try:
             actual_arr = np.stack(motor_qpos_history, axis=0)  # (T, 10)
-            raw_arr = np.stack(raw_target_history, axis=0) if len(raw_target_history) == len(motor_qpos_history) else None
-            filt_arr = np.stack(filt_target_history, axis=0) if len(filt_target_history) == len(motor_qpos_history) else None
+            targ_arr = np.stack(target_history, axis=0) if len(target_history) == len(motor_qpos_history) else None
             T = actual_arr.shape[0]
             time_axis = np.arange(T) * dt_frame
             rows, cols = 5, 2
@@ -447,27 +499,23 @@ class VisualizePolicyCallback:
             for row, j in enumerate(range(0, 5)):
                 ax_left = axes_fj[row * cols]
                 ax_left.plot(time_axis, actual_arr[:, j], color='tab:blue', linewidth=1.4, label='Actual')
-                if raw_arr is not None:
-                    ax_left.plot(time_axis, raw_arr[:, j], color='orange', linewidth=1.0, linestyle='--', label='Target Raw')
-                if filt_arr is not None:
-                    ax_left.plot(time_axis, filt_arr[:, j], color='tab:green', linewidth=1.2, label='Target Filtered')
+                if targ_arr is not None:
+                    ax_left.plot(time_axis, targ_arr[:, j], color='tab:green', linewidth=1.2, linestyle='--', label='Target')
                 ax_left.set_title(joint_names[j])
                 ax_left.set_ylabel('Angle (rad)')
                 ax_left.grid(alpha=0.3)
                 if row == 0:
-                    ax_left.legend(frameon=False, fontsize=8, ncol=3, loc='upper right')
+                    ax_left.legend(frameon=False, fontsize=8, ncol=2, loc='upper right')
             for row, j in enumerate(range(5, 10)):
                 ax_right = axes_fj[row * cols + 1]
                 ax_right.plot(time_axis, actual_arr[:, j], color='tab:blue', linewidth=1.4, label='Actual')
-                if raw_arr is not None:
-                    ax_right.plot(time_axis, raw_arr[:, j], color='orange', linewidth=1.0, linestyle='--', label='Target Raw')
-                if filt_arr is not None:
-                    ax_right.plot(time_axis, filt_arr[:, j], color='tab:green', linewidth=1.2, label='Target Filtered')
+                if targ_arr is not None:
+                    ax_right.plot(time_axis, targ_arr[:, j], color='tab:green', linewidth=1.2, linestyle='--', label='Target')
                 ax_right.set_title(joint_names[j])
                 ax_right.grid(alpha=0.3)
             axes_fj[8].set_xlabel('Time (s)')
             axes_fj[9].set_xlabel('Time (s)')
-            fig_j.suptitle('Joint Angles: Actual vs PD Targets (Raw & Filtered)')
+            fig_j.suptitle('Joint Angles: Actual vs PD Targets')
             fig_j.tight_layout(rect=[0, 0, 1, 0.96])
             joint_plot_path = save_dir / f"{base_name}_joint_angles.png"
             fig_j.savefig(joint_plot_path, dpi=160)
