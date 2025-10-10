@@ -32,7 +32,7 @@ ppo_training_params = {
     'clipping_epsilon': 0.2,
     'discounting': 0.97,  # TODO: Used to be 0.97. Change back?
     'entropy_cost': 0.005,  # Increased initially to encourage exploration. TODO: anneal down to 0?
-    'episode_length': 512,
+    'episode_length': 1024,
     'learning_rate': 3e-4,  # Was 3e-4
     'max_grad_norm': 1.0,
     'normalize_observations': True,
