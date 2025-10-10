@@ -217,7 +217,7 @@ class CassieEnv(mjx_env.MjxEnv):
         qvel = jnp.zeros(self._mjx_model.nv)
 
         data = mjx_env.init(self._mjx_model, qpos=qpos, qvel=qvel)
-        obs = self._get_obs(data)
+        obs = self._get_obs(data, jnp.zeros((self.action_size,)))
 
         info = {
             "rng": rng,
@@ -253,31 +253,21 @@ class CassieEnv(mjx_env.MjxEnv):
         """
         rng = state.info["rng"]
 
-        action = jnp.clip(action, -1.0, 1.0)
-
-        # 1. Convert action to raw joint position targets (vector length 10)
         raw_pos_targets = self._action_to_jnt_targets(action)
 
-        # 2. Filter targets (for smoother commanded motion)
-        target_filter = state.info["target_filter"]
-        filtered_targets, new_target_filter = target_filter.apply(raw_pos_targets)
-
-        # 3. PD control with filtered velocities
-        # We'll pass filter state so _pd_control can update it.
         torques = self._pd_control(
             state.data,
             filtered_targets,
             self._p_gain,
             self._d_gain,
         )
-        torques = self._limit_torque_rate(torques, state.info["last_torques"])
         torques = jnp.clip(torques, self._torque_lowers, self._torque_uppers)
 
         data = mjx_env.step(
             self._mjx_model, state.data, torques, self.n_substeps
         )
 
-        obs = self._get_obs(data)
+        obs = self._get_obs(data, torques)
 
         # Get reward components. `_get_reward` returns ((per_step_raw, event_raw), (lift_given_new, current_both_feet, current_com_error))
         # (per_step_raw, event_raw), (lift_given_new, current_both_feet, current_com_error) = self._get_reward(data, action, state.info)
@@ -319,8 +309,8 @@ class CassieEnv(mjx_env.MjxEnv):
             done=done,
             info=new_info
         )
-    
-    def _get_obs(self, data) -> jax.Array:
+
+    def _get_obs(self, data: mjx.Data, last_torques: jax.Array) -> jax.Array:
         """Constructs observation from mjx.Data (Cassie)."""
         # TODO: separate "state" and "privileged state"
         # TODO: We are now using joint angle deltas. Consider changing the action
@@ -330,27 +320,39 @@ class CassieEnv(mjx_env.MjxEnv):
         #       that useful right now because state is relatively Markovian. But may
         #       be useful later when noise and external pushes are added.
 
+        # Base orientation (world->body quaternion in MuJoCo convention)
+        base_quat = data.qpos[QPosIdx.BASE_QUAT]
+
+        # Yaw-invariant (tilt-only) quaternion: remove yaw component
+        rpy = math_utils.quat2euler(base_quat)  # [roll, pitch, yaw]
+        tilt_quat = math_utils.euler2quat(jnp.array([rpy[0], rpy[1], 0.0]))
+
+        pelvis_height = data.qpos[QPosIdx.BASE_HEIGHT]
+
+        # Joint positions / velocities
         motor_qpos = data.qpos[QPosIdx.MOTORS]
         motor_qvel = data.qvel[QVelIdx.MOTORS]
-        pelvis_qvel = data.qvel[QVelIdx.BASE]
 
-        # Add pelvis orientation as a flat quaternion
-        pelvis_quat = data.qpos[QPosIdx.BASE_QUAT]
+        # World-frame linear & angular velocities
+        lin_vel_world = data.qvel[QVelIdx.BASE_LIN_VEL]
+        ang_vel_body = data.qvel[QVelIdx.BASE_ANG_VEL]  # Angular velocity is already in body frame
 
-        # Pelvis height (z coord of root)
-        pelvis_height = data.qpos[QPosIdx.BASE_HEIGHT]  # shape (1,)
-
+        # Rotate world velocities into body frame
+        lin_vel_body = math_utils.vec_world_to_body(base_quat, lin_vel_world)
         # Use difference between current motor angles and the standing pose
         motor_qpos_delta = motor_qpos - self._standing_jnt_angles
+
 
         # Concatenate into a single vector. Order chosen to keep base-state first,
         # then motor errors and velocities, then pelvis vel, then foot contact and com->support.
         obs = jnp.concatenate([
             pelvis_height,
-            pelvis_quat,
+            tilt_quat,
             motor_qpos_delta,
-            pelvis_qvel,
-            motor_qvel
+            lin_vel_body,
+            ang_vel_body,
+            motor_qvel,
+            last_torques
         ])
 
         return obs
@@ -500,14 +502,3 @@ class CassieEnv(mjx_env.MjxEnv):
         vel_error = -raw_motor_qvel  # desire zero velocity
         torques = p_gain * pos_error + d_gain * vel_error + self._standing_torques
         return torques
-    
-    def _limit_torque_rate(
-            self,
-            torques: jax.Array,
-            last_torques: jax.Array
-        ) -> jax.Array:
-        """Clips torques if changes by more than the max torque rate."""
-        max_torque_rate = (self._torque_uppers - self._torque_lowers) / 0.6  # Moves through the full range in 0.6 seconds
-        max_delta = max_torque_rate * self.dt
-        return jnp.clip(torques, last_torques - max_delta, last_torques + max_delta)
-    

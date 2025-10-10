@@ -61,6 +61,7 @@ class QPosIdx:
 class QVelIdx:
     BASE: jax.Array = jnp.array([0, 1, 2, 3, 4, 5])
     BASE_LIN_VEL: jax.Array = jnp.array([0, 1, 2])
+    BASE_ANG_VEL: jax.Array = jnp.array([3, 4, 5])
     MOTORS: jax.Array = jnp.array([
         6, 7, 8, 12, 18,
         19, 20, 21, 25, 31
