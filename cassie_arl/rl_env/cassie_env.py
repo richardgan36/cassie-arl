@@ -239,10 +239,7 @@ class CassieEnv(mjx_env.MjxEnv):
             "reward_components": RewardComponents.zeros(),
             "last_action": jnp.zeros((self.action_size,)),
             "last_torques": jnp.zeros((self.action_size,)),
-            # Filter states
-            "target_filter": self._target_filter,
-            "raw_pos_targets": jnp.zeros((self.action_size,)),
-            "filtered_pos_targets": jnp.zeros((self.action_size,)),
+            "pos_targets": jnp.zeros((self.action_size,)),
         }
 
         return mjx_env.State(
@@ -311,9 +308,7 @@ class CassieEnv(mjx_env.MjxEnv):
             "reward_components": RewardComponents(**per_step_scaled),
             "last_action": action,  # For action rate cost
             "last_torques": torques,  # For torque rate limiting
-            "target_filter": new_target_filter,
-            "raw_pos_targets": pos_targets,
-            "filtered_pos_targets": filtered_targets,
+            "pos_targets": pos_targets,
         }
         return state.replace(
             data=data,
@@ -383,13 +378,11 @@ class CassieEnv(mjx_env.MjxEnv):
         All rewards/costs are in [0, 1]. Their weights in self._config.reward_config.scales
         determine their relative importance and sign.
         """
-        # TODO: IMPORTANT: need to reward active recovery strategies, not just standing still
-        # TODO: look into selective/adaptive rewards e.g. lift costs for movement when perturbing robot
 
-        # Split components into per-step (integrated over dt) and event (one-time) rewards.
         per_step = {
             "alive": self._reward_alive(),
             "pelvis_lin_vel": self._cost_pelvis_lin_vel(data),
+            "pelvis_ang_vel": self._cost_pelvis_ang_vel(data),
             "pelvis_tilt": self._cost_pelvis_tilt(data),
             "motor_ref_error": self._cost_motor_reference_error(data),
             "action_rate": self._cost_action_rate(action, info["last_action"]),
@@ -409,6 +402,12 @@ class CassieEnv(mjx_env.MjxEnv):
         v_scale = 0.8**2  # Normalizing constant (m/s)^2
         cost = v_sq / v_scale
         return jnp.clip(cost, 0.0, 1.0)
+    
+    def _cost_pelvis_ang_vel(self, data: mjx.Data) -> jax.Array:
+        ang_vel = data.qvel[QVelIdx.BASE_ANG_VEL]
+        ang_vel_sq_mean = jnp.mean(ang_vel**2)
+        err_scale = 1.1**2  # Normalizing constant (rad/s)^2
+        return jnp.clip(ang_vel_sq_mean / err_scale, 0.0, 1.0)
 
     def _cost_pelvis_tilt(self, data: mjx.Data) -> jax.Array:
         """Cost for pelvis orientation (deviation from standing)."""
