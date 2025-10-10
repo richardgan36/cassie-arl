@@ -59,6 +59,40 @@ def euler2quat(euler: jax.Array) -> jax.Array:
     return jnp.stack([w, x, y, z], axis=-1)
 
 
+def quat_mul(q1: jnp.ndarray, q2: jnp.ndarray) -> jnp.ndarray:
+    """Quaternion multiplication q = q1 * q2.
+    Rotates by q2 first, then q1.
+    """
+    w1, x1, y1, z1 = q1
+    w2, x2, y2, z2 = q2
+
+    return jnp.array([
+        w1*w2 - x1*x2 - y1*y2 - z1*z2,
+        w1*x2 + x1*w2 + y1*z2 - z1*y2,
+        w1*y2 - x1*z2 + y1*w2 + z1*x2,
+        w1*z2 + x1*y2 - y1*x2 + z1*w2
+    ])
+
+
+def quat_conjugate(q: jax.Array) -> jax.Array:
+    """Quaternion conjugate (w, -x, -y, -z)."""
+    return jnp.array([q[0], -q[1], -q[2], -q[3]])
+
+
+def quat_apply(q: jax.Array, v: jax.Array) -> jax.Array:
+    """Rotate vector v by quaternion q (q * v * q_conj)."""
+    # Promote v to pure quaternion
+    vq = jnp.concatenate([jnp.array([0.0]), v])
+    return quat_mul(quat_mul(q, vq), quat_conjugate(q))[1:]
+
+
+def vec_world_to_body(base_quat: jax.Array, v_world: jax.Array) -> jax.Array:
+    """Rotate world-frame vector into body frame."""
+    # base_quat maps body->world, so body_vec = q_conj * v_world * q
+    q_conj = quat_conjugate(base_quat)
+    return quat_apply(q_conj, v_world)
+
+
 def angle_diff(angle1: jax.Array, angle2: jax.Array) -> jax.Array:
     """
     Compute the wrapped difference between two angles in radians.
