@@ -136,8 +136,8 @@ class CassieEnv(mjx_env.MjxEnv):
         self._mj_model = mj.MjModel.from_xml_path(self._xml_path)
         self._mjx_model = mjx.put_model(self._mj_model)
 
-        # self._mj_model.vis.global_.offwidth = 3840
-        # self._mj_model.vis.global_.offheight = 2160
+        self._mj_model.vis.global_.offwidth = 3840
+        self._mj_model.vis.global_.offheight = 2160
 
         self._post_init()
 

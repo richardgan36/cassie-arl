@@ -19,16 +19,16 @@ logging.set_verbosity(logging.INFO)
 
 network_factory_params = {
     "policy_hidden_layer_sizes": (512, 256, 128),
-    "policy_obs_key": "state",
+    # "policy_obs_key": "state",
     "value_hidden_layer_sizes": (512, 256, 128),
-    "value_obs_key": "privileged_state",
+    # "value_obs_key": "privileged_state",
     # "init_noise_std": 2.0,          # Added to increase exploration
     # "state_dependent_std": True,    # Added to increase exploration
 }
 
 ppo_training_params = {
     'action_repeat': 1,
-    'batch_size': 256,
+    'batch_size': 4096,
     'clipping_epsilon': 0.2,
     'discounting': 0.97,  # TODO: Used to be 0.97. Change back?
     'entropy_cost': 0.005,  # Increased initially to encourage exploration. TODO: anneal down to 0?
@@ -47,7 +47,7 @@ ppo_training_params = {
     'restore_value_fn': True,
 }
 
-train_id = "test_tune_pd"  # Try to use PD control
+train_id = "parameterized_pd"  # Try to use PD control
 env = CassieEnv()
 
 # JIT-wrapped env functions kept as local variables and passed into the visualization callback
@@ -63,7 +63,7 @@ network_factory = functools.partial(
 )
 
 # --- Shorten training for testing ---
-ppo_training_params["num_evals"] = 0
+ppo_training_params["num_evals"] = 4
 ppo_training_params["episode_length"] = 5
 ppo_training_params["num_envs"] = 1
 ppo_training_params["num_minibatches"] = 4
@@ -75,10 +75,10 @@ logging.info("PPO training parameters:")
 logging.info(ppo_training_params)
 
 save_ckpt_dir = script_dir / "checkpoints" / f"{train_id}"
-restore_ckpt_path = script_dir / "checkpoints/try_pd_3/000083066880"
+# restore_ckpt_path = script_dir / "checkpoints/try_pd_3/000083066880"
 
 # Instantiate callback objects
-progress_cb = ProgressCallback(ppo_training_params, script_dir, train_id, save_plot=False)
+progress_cb = ProgressCallback(ppo_training_params, script_dir, train_id, save_plot=True)
 viz_cb = VisualizePolicyCallback(env, jit_reset, jit_step, script_dir, train_id, run_every_n_calls=1)
 
 train_fn = functools.partial(
@@ -88,7 +88,7 @@ train_fn = functools.partial(
     # progress_fn=progress_cb,
     policy_params_fn=viz_cb,
     # save_checkpoint_path=save_ckpt_dir.as_posix(),
-    restore_checkpoint_path=restore_ckpt_path.as_posix()
+    # restore_checkpoint_path=restore_ckpt_path.as_posix()
 )
 
 if "save_checkpoint_path" in train_fn.keywords:

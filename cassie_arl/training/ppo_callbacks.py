@@ -113,6 +113,7 @@ class VisualizePolicyCallback:
         target_history: List[np.ndarray] = field(default_factory=list)  # (T, 10) PD position targets used for control
         p_gain_history: List[np.ndarray] = field(default_factory=list)  # (T, 3) grouped Kp values (scaled)
         d_gain_history: List[np.ndarray] = field(default_factory=list)  # (T, 3) grouped Kd values (scaled)
+        observation_history: List[np.ndarray] = field(default_factory=list)  # (T, obs_dim) most recent single-step obs
         cumulative_reward: float = 0.0
 
     # ------------------------------- Init ----------------------------------------
@@ -225,6 +226,8 @@ class VisualizePolicyCallback:
                 latest_obs = np.array(state.info["obs_history"][0])
                 nu = int(self.env.mjx_model.nu)
                 data.torque_history.append(latest_obs[-nu:])
+                # Record the most recent single-step observation for overlays
+                data.observation_history.append(latest_obs)
             except Exception:
                 pass
             # Store targets used for this control step (raw + filtered) and resulting joint angles AFTER physics step
@@ -259,6 +262,7 @@ class VisualizePolicyCallback:
         frames_overlay = self._apply_overlays(frames, rollout)
         base_name, ani_save_dir, ani_save_path, dt_frame = self._save_video(current_step, frames_overlay)
         # Plots
+        self._plot_reward_components(rollout.reward_records, base_name, ani_save_dir, dt_frame)
         self._plot_torques(rollout.torque_history, base_name, ani_save_dir, dt_frame)
         self._plot_actions(rollout.actions_history, base_name, ani_save_dir, dt_frame)
         self._plot_gains(rollout.p_gain_history, rollout.d_gain_history, base_name, ani_save_dir, dt_frame)
@@ -287,45 +291,101 @@ class VisualizePolicyCallback:
             frame_rgb = np.array(frame).copy()
             foot = rollout.foot_infos[idx]
             reward_record = rollout.reward_records[idx]
-            # Left column
-            left_lines = [
-                f"Left foot z: {foot.left_foot_z:.3f} m",
-                f"Right foot z: {foot.right_foot_z:.3f} m",
-                f"Left tarsus z: {foot.left_tarsus_z:.3f} m",
-                f"Right tarsus z: {foot.right_tarsus_z:.3f} m",
-            ]
-            # Right column header
-            right_lines = [
-                f"Step Reward: {reward_record.step_reward:.4f}",
-                f"Cumulative Reward: {reward_record.cumulative_reward:.4f}",
-                "-----------------------------",
-                "Component           Raw Value | Weighted",
-            ]
-            # Components with raw + weighted
-            for name, weighted_value in reward_record.components.items():
-                scale = reward_scales.get(name, 1.0)
-                raw_value = weighted_value / scale if scale != 0 else 0.0
-                name_pad = f"{name}:".ljust(18)
-                right_lines.append(f"{name_pad} {raw_value:>8.4f} | {weighted_value:>8.4f}")
+            # Build left column (observations) and right column (reward components)
+            obs_data = rollout.observation_history[idx] if idx < len(rollout.observation_history) else None
+            left_lines = self._get_observation_overlay_text(obs_data, foot)
+            right_lines = self._get_reward_overlay_text(reward_record, reward_scales)
 
-            # Draw text
+            # Draw text with improved readability
+            font_scale = 0.8
+            thickness = 2
+            font = cv2.FONT_HERSHEY_SIMPLEX
             for li, line in enumerate(left_lines):
-                cv2.putText(frame_rgb, line, (10, 30 + li * 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                cv2.putText(frame_rgb, line, (10, 30 + li * 30), font, font_scale, (255, 255, 255), thickness)
             fw = frame_rgb.shape[1]
-            right_x = fw - 500
+            right_x = fw - 450
             for ri, line in enumerate(right_lines):
                 color = (255, 255, 255)
-                if ri >= 4:  # component rows
+                if ri >= 3:  # component rows (after header)
                     cname = line.split(':')[0]
                     if cname in reward_record.components:
-                        val = reward_record.components[cname]
-                        if val > 0:
+                        weighted_val = reward_record.components[cname]
+                        scale = reward_scales.get(cname, 1.0)
+                        raw_val = weighted_val / scale if scale != 0 else 0.0
+                        if raw_val > 0:
                             color = (0, 255, 0)
-                        elif val < 0:
+                        elif raw_val < 0:
                             color = (255, 100, 100)
-                cv2.putText(frame_rgb, line, (right_x, 30 + ri * 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                cv2.putText(frame_rgb, line, (right_x, 30 + ri * 30), font, font_scale, color, thickness)
             out_frames.append(frame_rgb)
         return out_frames
+
+    def _get_observation_overlay_text(self, obs_data, foot):
+        """Prepare left-column observation text using latest single-step observation.
+
+        Observation layout (current CassieEnv):
+          [0]     pelvis_height (1)
+          [1:5]   tilt_quat (4)
+          [5:15]  motor_qpos_delta (10)
+          [15:18] lin_vel_body (3)
+          [18:21] ang_vel_body (3)
+          [21:31] motor_qvel (10)
+          [31:33] feet_contact (2)
+          [33:43] last_torques (10)
+        """
+        if obs_data is None:
+            return ["Observations: Not available"]
+
+        lines = []
+        lines.append("=== OBSERVATIONS ===")
+        try:
+            # Pelvis height
+            lines.append(f"Pelvis height: {obs_data[0]:.3f} m")
+
+            # Tilt quaternion and derived RPY
+            qw, qx, qy, qz = obs_data[1:5]
+            lines.append(f"Tilt quat: [{qw:.3f}, {qx:.3f}, {qy:.3f}, {qz:.3f}]")
+            import math
+            sinr_cosp = 2 * (qw * qx + qy * qz)
+            cosr_cosp = 1 - 2 * (qx * qx + qy * qy)
+            roll = math.atan2(sinr_cosp, cosr_cosp)
+            sinp = 2 * (qw * qy - qz * qx)
+            if abs(sinp) >= 1:
+                pitch = math.copysign(math.pi / 2, sinp)
+            else:
+                pitch = math.asin(sinp)
+            siny_cosp = 2 * (qw * qz + qx * qy)
+            cosy_cosp = 1 - 2 * (qy * qy + qz * qz)
+            yaw = math.atan2(siny_cosp, cosy_cosp)
+            lines.append(f"Tilt RPY (deg): [{math.degrees(roll):.1f}, {math.degrees(pitch):.1f}, {math.degrees(yaw):.1f}]")
+
+            # Body-frame velocities
+            lin_vel = obs_data[15:18]
+            ang_vel = obs_data[18:21]
+            lines.append(f"Lin vel [x,y,z]: [{lin_vel[0]:.2f}, {lin_vel[1]:.2f}, {lin_vel[2]:.2f}]")
+            lines.append(f"Ang vel [x,y,z]: [{ang_vel[0]:.2f}, {ang_vel[1]:.2f}, {ang_vel[2]:.2f}]")
+
+            # Foot heights
+            lines.append("--- Foot Heights ---")
+            lines.append(f"L foot z: {foot.left_foot_z:.3f} m")
+            lines.append(f"R foot z: {foot.right_foot_z:.3f} m")
+        except Exception:
+            # Fallback minimal info if parsing fails
+            lines = ["Observations: parse error"]
+        return lines
+
+    def _get_reward_overlay_text(self, reward_record, reward_scales: Dict[str, float]):
+        """Prepare right-column reward text showing raw per-step components with actual signs (exclude 'alive')."""
+        lines = [
+            f"Step Reward: {reward_record.step_reward:.4f}",
+            f"Cumulative: {reward_record.cumulative_reward:.4f}",
+            "--- Raw Rewards (actual sign, unweighted) ---",
+        ]
+        for name, weighted_value in reward_record.components.items():
+            scale = reward_scales.get(name, 1.0)
+            raw_value = weighted_value / scale if scale != 0 else 0.0
+            lines.append(f"{name}: {raw_value * scale:.4f}")
+        return lines
 
     # ----------------------------- Saving Artifacts ------------------------------
     def _save_video(self, current_step: int, frames_overlay: List[np.ndarray]):
@@ -414,7 +474,7 @@ class VisualizePolicyCallback:
                 ax_right.grid(alpha=0.3)
             axes_fa[8].set_xlabel('Time (s)')
             axes_fa[9].set_xlabel('Time (s)')
-            fig_a.suptitle('Normalized Joint Actions (first 10 dims)')
+            fig_a.suptitle('Normalized Joint Actions')
             fig_a.tight_layout(rect=[0, 0, 1, 0.96])
             actions_plot_path = save_dir / f"{base_name}_actions.png"
             fig_a.savefig(actions_plot_path, dpi=160)
@@ -467,6 +527,54 @@ class VisualizePolicyCallback:
             logging.info(f"Saved PD gains figure to {gains_plot_path}")
         except Exception as e:
             logging.exception(f"Failed generating/saving PD gains figure: {e}")
+
+    def _plot_reward_components(
+        self,
+        reward_records: List['VisualizePolicyCallback.RewardRecord'],
+        base_name: str,
+        save_dir: Path,
+        dt_frame: float,
+    ):
+        """Plot per-step weighted reward components over time (excluding 'alive')."""
+        if len(reward_records) == 0:
+            logging.warning("No reward data collected; skipping reward component plot.")
+            return
+        try:
+            # Union of component names across steps, excluding 'alive'
+            all_keys: List[str] = []
+            seen = set()
+            for rr in reward_records:
+                for k in rr.components.keys():
+                    if k == 'alive':
+                        continue
+                    if k not in seen:
+                        seen.add(k)
+                        all_keys.append(k)
+            if len(all_keys) == 0:
+                logging.warning("Reward records contain no component entries (excluding 'alive'); skipping plot.")
+                return
+            T = len(reward_records)
+            comp_matrix = np.zeros((T, len(all_keys)), dtype=float)
+            for t, rr in enumerate(reward_records):
+                for k_i, k in enumerate(all_keys):
+                    if k in rr.components:
+                        comp_matrix[t, k_i] = rr.components[k]
+            time_axis = np.arange(T) * dt_frame
+            fig_rc, ax_rc = plt.subplots(figsize=(10, 6))
+            for k_i, k in enumerate(all_keys):
+                ax_rc.plot(time_axis, comp_matrix[:, k_i], label=k, linewidth=1.3)
+            ax_rc.set_xlabel('Time (s)')
+            ax_rc.set_ylabel('Weighted Component Value')
+            ax_rc.set_title('Reward Components (per step, weighted, excl. alive)')
+            ax_rc.grid(alpha=0.3)
+            ax_rc.legend(frameon=False, fontsize=8, ncol=2 if len(all_keys) > 8 else 1)
+            fig_rc.tight_layout()
+            reward_plot_path = save_dir / f"{base_name}_reward_components.png"
+            fig_rc.savefig(reward_plot_path, dpi=160)
+            plt.close(fig_rc)
+            logging.info(f"Saved reward components plot to {reward_plot_path}")
+        except Exception as e:
+            logging.exception(f"Failed generating/saving reward components plot: {e}")
 
     def _plot_joint_angles(
         self,
