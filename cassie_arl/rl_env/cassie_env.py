@@ -61,7 +61,15 @@ def default_config() -> config_dict.ConfigDict:
 
         soft_joint_pos_limit_factors=0.95,  # Fraction of full range to use as soft limits on actuated joints
 
-        # PD Gains
+        # PD control parameters
+
+        max_p_gain=5.0,  # Maximum Kp that can be learned by the agent
+        max_d_gain=0.5,  # Maximum Kd that can be learned by the agent
+
+        # max_joint_delta_frac is the fraction of the total joint range
+        # that the action can command as a delta from the standing pose.
+        max_joint_delta_frac=0.6,
+
         # p_gain = jnp.array([
         #     8, 4, 4, 10, 0.4,
         #     8, 4, 4, 10, 0.4
@@ -89,7 +97,7 @@ def default_config() -> config_dict.ConfigDict:
 
         # Reset noise configuration
         reset_noise_config=config_dict.create(
-            level=0.6,  # Set to 0.0 to disable noise.
+            level=0.5,  # Set to 0.0 to disable noise.
             scales=config_dict.create(
                 xy=jnp.array([-0.1, 0.1]),            # Additive
                 z=jnp.array([0, 0.05]),               # Additive
@@ -107,7 +115,8 @@ def default_config() -> config_dict.ConfigDict:
         reward_config=config_dict.create(
             scales=config_dict.create(
                 alive=2.0,
-                pelvis_lin_vel=-0.6,
+                pelvis_lin_vel=-0.5,
+                pelvis_ang_vel=-0.6,
                 pelvis_tilt=-0.7,
                 motor_ref_error=-0.7,
                 action_rate=-0.4,
@@ -152,13 +161,11 @@ class CassieEnv(mjx_env.MjxEnv):
         standing_quat = self._init_qpos[QPosIdx.BASE_QUAT]
         self._standing_base_rpy = math_utils.quat2euler(standing_quat)
 
-        # Apply soft limits on actuated joints for safe hardware deployment
-        self._jnt_lowers = jnp.array(self._mj_model.jnt_range[JntRangeIdx.MOTORS, 0])
-        self._jnt_uppers = jnp.array(self._mj_model.jnt_range[JntRangeIdx.MOTORS, 1])
-        jnt_c = (self._jnt_lowers + self._jnt_uppers) / 2
-        jnt_r = self._jnt_uppers - self._jnt_lowers
-        self._jnt_soft_lowers = jnt_c - 0.5 * jnt_r * self._config.soft_joint_pos_limit_factors
-        self._jnt_soft_uppers = jnt_c + 0.5 * jnt_r * self._config.soft_joint_pos_limit_factors
+        jnt_lowers = self._mj_model.jnt_range[JntRangeIdx.MOTORS, 0]
+        jnt_uppers = self._mj_model.jnt_range[JntRangeIdx.MOTORS, 1]
+        jnt_ranges = jnt_uppers - jnt_lowers
+        self._max_joint_deltas = jnp.array(jnt_ranges * self._config.max_joint_delta_frac)
+
 
         self._torque_lowers = jnp.array(self._mj_model.actuator_ctrlrange[:, 0])
         self._torque_uppers = jnp.array(self._mj_model.actuator_ctrlrange[:, 1])
@@ -179,10 +186,6 @@ class CassieEnv(mjx_env.MjxEnv):
 
         self._left_foot_gid = geoms_of_body(self._mj_model, self._left_foot_id)
         self._right_foot_gid = geoms_of_body(self._mj_model, self._right_foot_id)
-
-        # PD gains
-        self._p_gain = self._config.p_gain
-        self._d_gain = self._config.d_gain
 
         # -------------------
         # Butterworth filter setup
@@ -208,8 +211,14 @@ class CassieEnv(mjx_env.MjxEnv):
 
     @property
     def action_size(self) -> int:
-        # Cassie has 10 actuators (5 per leg)
-        return self._mjx_model.nu
+        """Number of action dimensions.
+        
+        Size is 16. The first 10 actions correspond to joint angle deltas from
+        the standing pose. The next 3 actions are the proportional gain (Kp)
+        for [hip roll/yaw], [hip pitch / knee], [foot] respectively.
+        The last 3 actions are the derivative gain (Kd) for the same groups.
+        """
+        return self._mjx_model.nu + 6
 
     @property
     def mj_model(self) -> mj.MjModel:
@@ -263,13 +272,35 @@ class CassieEnv(mjx_env.MjxEnv):
         """
         rng = state.info["rng"]
 
-        pos_targets = self._action_to_jnt_targets(action)
+        # Action consists of joint deltas + PD gains
+        (jnt_deltas_raw, p_gains_raw, d_gains_raw) = jnp.split(
+            action,
+            [self._mjx_model.nu, self._mjx_model.nu + 3]
+        )
+        p_gains_raw_scaled = (p_gains_raw + 1.0) / 2.0 * self._config.max_p_gain  # Ensure positive
+        d_gains_raw_scaled = (d_gains_raw + 1.0) / 2.0 * self._config.max_d_gain  # Ensure positive
+        p_gains = jnp.array([
+            p_gains_raw_scaled[0],
+            p_gains_raw_scaled[0],
+            p_gains_raw_scaled[1],
+            p_gains_raw_scaled[1],
+            p_gains_raw_scaled[2],
+        ])
+        d_gains = jnp.array([
+            d_gains_raw_scaled[0],
+            d_gains_raw_scaled[0],
+            d_gains_raw_scaled[1],
+            d_gains_raw_scaled[1],
+            d_gains_raw_scaled[2],
+        ])
+
+        pos_targets = self._action_to_jnt_targets(jnt_deltas_raw)  # The first 10 actions are joint angle deltas in [-1, 1]
 
         torques = self._pd_control(
             state.data,
             pos_targets,
-            self._p_gain,
-            self._d_gain,
+            p_gains,
+            d_gains,
         )
         torques = jnp.clip(torques, self._torque_lowers, self._torque_uppers)
 
@@ -350,6 +381,10 @@ class CassieEnv(mjx_env.MjxEnv):
         # Use difference between current motor angles and the standing pose
         motor_qpos_delta = motor_qpos - self._standing_jnt_angles
 
+        # Foot contacts (approximate, based on foot height)
+        left_foot_contact = self._left_foot_height(data) < FOOT_CONTACT_THRESHOLD
+        right_foot_contact = self._right_foot_height(data) < FOOT_CONTACT_THRESHOLD
+        feet_contact = jnp.array([left_foot_contact, right_foot_contact], dtype=jnp.float32)
 
         # Concatenate into a single vector. Order chosen to keep base-state first,
         # then motor errors and velocities, then pelvis vel, then foot contact and com->support.
@@ -360,6 +395,7 @@ class CassieEnv(mjx_env.MjxEnv):
             lin_vel_body,
             ang_vel_body,
             motor_qvel,
+            feet_contact,
             last_torques
         ])
 
@@ -486,19 +522,21 @@ class CassieEnv(mjx_env.MjxEnv):
         
         return jnp.logical_or(left_hit, right_hit)
 
-    def _action_to_jnt_targets(self, action: jax.Array) -> jax.Array:
-        """
-        Scales normalized actions [-1, 1] to motor joint angles.
+    def _action_to_jnt_targets(self, joint_deltas_normalized: jax.Array) -> jax.Array:
+        """Scales normalized actions [-1, 1] to motor joint angles.
 
         The action is interpreted as normalized deltas of the 10 actuated
-        joints from the standing pose angles. The scaling consists of a
-        piecewise linear mapping:
-            [-1, 0] -> [soft lower joint limit, standing angle]
-            [ 0, 1] -> [standing angle, soft upper joint limit]
+        joints from the standing pose angles. The scaling is linear:
+            delta = action * max_delta
+            target = standing + delta
+        
+        Note:
+            The joint targets returned by this function do NOT respect
+            the joint limits, and this is intentional - in order to
+            maintain the maximum allowed joint angle, the PD controller
+            may require the target to be outside the joint limits.
         """
-        s_pos = self._jnt_soft_uppers - self._standing_jnt_angles   # Positive side span
-        s_neg = self._standing_jnt_angles - self._jnt_soft_lowers   # Negative side span
-        return self._standing_jnt_angles + 0.5 * (s_pos + s_neg) * action + 0.5 * (s_pos - s_neg) * jnp.abs(action)
+        return self._standing_jnt_angles + joint_deltas_normalized * self._max_joint_deltas
 
     def _pd_control(
             self,
@@ -511,8 +549,8 @@ class CassieEnv(mjx_env.MjxEnv):
         motor_qpos = data.qpos[QPosIdx.MOTORS]
         raw_motor_qvel = data.qvel[QVelIdx.MOTORS]
         pos_error = pos_targets - motor_qpos
-        vel_error = -raw_motor_qvel  # desire zero velocity
-        torques = p_gain * pos_error + d_gain * vel_error + self._standing_torques
+        vel_error = -raw_motor_qvel  # Desire zero velocity
+        torques = p_gain * pos_error + d_gain * vel_error
         return torques
 
     def _add_perturbations(
@@ -591,3 +629,12 @@ class CassieEnv(mjx_env.MjxEnv):
         )
 
         return rng, qpos, qvel
+
+    def _left_foot_height(self, data: mjx.Data) -> jax.Array:
+        return data.xpos[self._left_foot_id, 2] - FOOT_OFFSET
+
+    def _right_foot_height(self, data: mjx.Data) -> jax.Array:
+        return data.xpos[self._right_foot_id, 2] - FOOT_OFFSET
+
+
+
