@@ -45,7 +45,6 @@ class RewardComponents:
         )
 
 
-
 def default_config() -> config_dict.ConfigDict:
     return config_dict.create(
         # --------------------------------
@@ -88,6 +87,19 @@ def default_config() -> config_dict.ConfigDict:
         #     0.0, 0.0, 0.0, 0.0, 0.0
         # ]),
 
+        # Reset noise configuration
+        reset_noise_config=config_dict.create(
+            level=0.6,  # Set to 0.0 to disable noise.
+            scales=config_dict.create(
+                xy=jnp.array([-0.1, 0.1]),            # Additive
+                z=jnp.array([0, 0.05]),               # Additive
+                yaw=jnp.array([-3.14, 3.14]),         # Additive
+                roll_pitch=jnp.array([-0.05, 0.05]),  # Additive
+                motors=jnp.array([-0.03, 0.03]),      # Multiplicative: Motors *= U(1-0.03, 1+0.03)
+                dxyz=jnp.array([-0.1, 0.1]),          # Additive
+                drpy=jnp.array([-0.12, 0.12]),        # Additive
+            ),
+        ),
 
         # Reward function configuration
         # Except for the "fall" cost, which is a one-time cost, all reward weights
@@ -216,13 +228,14 @@ class CassieEnv(mjx_env.MjxEnv):
         qpos = self._init_qpos
         qvel = jnp.zeros(self._mjx_model.nv)
 
+        rng, qpos, qvel = self._add_perturbations(rng, qpos, qvel)
+
         data = mjx_env.init(self._mjx_model, qpos=qpos, qvel=qvel)
         obs = self._get_obs(data, jnp.zeros((self.action_size,)))
 
         info = {
             "rng": rng,
             "step": 0,
-            # Keep reward components as a PyTree for JIT friendliness.
             "reward_components": RewardComponents.zeros(),
             "last_action": jnp.zeros((self.action_size,)),
             "last_torques": jnp.zeros((self.action_size,)),
@@ -253,11 +266,11 @@ class CassieEnv(mjx_env.MjxEnv):
         """
         rng = state.info["rng"]
 
-        raw_pos_targets = self._action_to_jnt_targets(action)
+        pos_targets = self._action_to_jnt_targets(action)
 
         torques = self._pd_control(
             state.data,
-            filtered_targets,
+            pos_targets,
             self._p_gain,
             self._d_gain,
         )
@@ -299,7 +312,7 @@ class CassieEnv(mjx_env.MjxEnv):
             "last_action": action,  # For action rate cost
             "last_torques": torques,  # For torque rate limiting
             "target_filter": new_target_filter,
-            "raw_pos_targets": raw_pos_targets,
+            "raw_pos_targets": pos_targets,
             "filtered_pos_targets": filtered_targets,
         }
         return state.replace(
@@ -502,3 +515,80 @@ class CassieEnv(mjx_env.MjxEnv):
         vel_error = -raw_motor_qvel  # desire zero velocity
         torques = p_gain * pos_error + d_gain * vel_error + self._standing_torques
         return torques
+
+    def _add_perturbations(
+            self, rng: jax.Array, qpos: jax.Array, qvel: jax.Array
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """Add uniform random perturbations to base and motor positions/velocities."""
+        noise_level = self._config.reset_noise_config.level
+        rng, key = jax.random.split(rng)
+        qpos = qpos.at[QPosIdx.BASE_XY].add(
+            jax.random.uniform(
+                key,
+                (2,),
+                minval=self._config.reset_noise_config.scales.xy[0] * noise_level,
+                maxval=self._config.reset_noise_config.scales.xy[1] * noise_level
+            )
+        )
+
+        rng, key = jax.random.split(rng)
+        qpos = qpos.at[QPosIdx.BASE_HEIGHT].add(
+            jax.random.uniform(
+                key,
+                (1,),
+                minval=self._config.reset_noise_config.scales.z[0] * noise_level,
+                maxval=self._config.reset_noise_config.scales.z[1] * noise_level
+            )
+        )
+
+        rng, key = jax.random.split(rng)
+        yaw = jax.random.uniform(
+            key,
+            (1,),
+            minval=self._config.reset_noise_config.scales.yaw[0] * noise_level,
+            maxval=self._config.reset_noise_config.scales.yaw[1] * noise_level
+        )
+        rng, key = jax.random.split(rng)
+        roll_pitch = jax.random.uniform(
+            key,
+            (2,),
+            minval=self._config.reset_noise_config.scales.roll_pitch[0] * noise_level,
+            maxval=self._config.reset_noise_config.scales.roll_pitch[1] * noise_level
+        )
+        quat = math_utils.euler2quat(jnp.concatenate([roll_pitch, yaw]))
+        # Compose: new orientation = delta * base
+        new_quat = math_utils.quat_mul(quat, qpos[QPosIdx.BASE_QUAT])
+        new_quat = new_quat / jnp.linalg.norm(new_quat)  # Normalize
+        qpos = qpos.at[QPosIdx.BASE_QUAT].set(new_quat)
+
+        # Noise is multiplicative on motor angles
+        rng, key = jax.random.split(rng)
+        qpos = qpos.at[QPosIdx.MOTORS].multiply(
+            jax.random.uniform(
+                key,
+                (10,),
+                minval=1 + self._config.reset_noise_config.scales.motors[0] * noise_level,
+                maxval=1 + self._config.reset_noise_config.scales.motors[1] * noise_level
+            )
+        )
+
+        rng, key = jax.random.split(rng)
+        dxyz_delta = jax.random.uniform(
+            key, 
+            (3,),
+            minval=self._config.reset_noise_config.scales.dxyz[0] * noise_level,
+            maxval=self._config.reset_noise_config.scales.dxyz[1] * noise_level
+        )
+        rng, key = jax.random.split(rng)
+        drpy_delta = jax.random.uniform(
+            key,
+            (3,),
+            minval=self._config.reset_noise_config.scales.drpy[0] * noise_level,
+            maxval=self._config.reset_noise_config.scales.drpy[1] * noise_level
+        )
+
+        qvel = qvel.at[QVelIdx.BASE].add(
+            jnp.concatenate([dxyz_delta, drpy_delta])
+        )
+
+        return rng, qpos, qvel
