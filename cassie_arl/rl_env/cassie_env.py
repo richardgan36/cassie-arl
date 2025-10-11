@@ -1,5 +1,6 @@
 from typing import Any, Dict, Optional, Union
 from pathlib import Path
+import math
 
 import jax
 import jax.numpy as jnp
@@ -52,6 +53,22 @@ class RewardComponents:
         )
 
 
+@struct.dataclass
+class PushState:
+    """PyTree for storing random push state between steps."""
+    steps_remaining: jax.Array  # int32
+    cooldown: jax.Array         # int32
+    force6: jax.Array           # (6,)
+
+    @classmethod
+    def zeros(cls) -> "PushState":
+        return cls(
+            steps_remaining=jnp.array(0, dtype=jnp.int32),
+            cooldown=jnp.array(0, dtype=jnp.int32),
+            force6=jnp.zeros((6,), dtype=jnp.float32),
+        )
+
+
 def default_config() -> config_dict.ConfigDict:
     return config_dict.create(
         # --------------------------------
@@ -93,7 +110,7 @@ def default_config() -> config_dict.ConfigDict:
 
         # --- Reward function configuration ---
         reward_config=config_dict.create(
-            scales=config_dict.create(
+            weights=config_dict.create(
                 alive=1.5,  # Initially 2.0 but reduced since other costs have been reduced
                 pelvis_height=-0.0,  # Initially -0.3, but after training, the agent discovers it can get high reward without tracking height closely
                 pelvis_lin_vel=-0.5,  # Initially -0.3 but increased to encourage stability
@@ -104,6 +121,19 @@ def default_config() -> config_dict.ConfigDict:
                 torques=-0.05,
                 gain_rate=-0.0,  # Initially -0.1 to encourate constant gains but removed now that the agent has already learned this behavior 
             ),
+        ),
+
+        # --- Random push perturbations during training ---
+        # Time-invariant configuration (seconds, hertz) so behavior doesn't depend on ctrl_dt
+        pushes=config_dict.create(
+            enabled=False,               # Enable/disable pushes globally
+            start_rate_hz=2.0,           # Push start attempt rate (events per second)
+            min_interval_s=0.50,         # Minimum time between pushes (s)
+            duration_s=0.04,             # Duration of each push (s)
+            force_range=jnp.array([120.0, 320.0]),  # Magnitude (N) of horizontal push
+            torque_range=jnp.array([0.0, 0.0]),     # Optional body torque magnitude (N·m); default 0 (off)
+            target_body="cassie-pelvis",           # Body name to apply the push on (world frame)
+            direction_mode="horizontal",           # [horizontal|any3d] (horizontal by default)
         ),
 
         # filters=config_dict.create(
@@ -153,7 +183,7 @@ class CassieEnv(mjx_env.MjxEnv):
         # Precomputed constants for rewards/costs (avoid repeated pow/div)
         # -------------------
         # Reference pelvis height
-        self._pelvis_height_ref = 0.985
+        # self._pelvis_height_ref = 0.985
 
         # Inverse-squared scales (1 / scale^2) for various costs
         self._inv_height_err_scale_sq = jnp.array(1.0 / (0.02 ** 2))
@@ -188,7 +218,7 @@ class CassieEnv(mjx_env.MjxEnv):
 
         # MJCF geom and body IDs
         # self._floor_gid = self._mj_model.geom("floor").id
-        # self._pelvis_id = self._mj_model.body("cassie-pelvis").id
+        self._pelvis_id = self._mj_model.body("cassie-pelvis").id
         self._left_foot_id = self._mj_model.body("left-foot").id
         self._right_foot_id = self._mj_model.body("right-foot").id
         self._left_tarsus_id = self._mj_model.body("left-tarsus").id
@@ -197,20 +227,8 @@ class CassieEnv(mjx_env.MjxEnv):
         # self._left_foot_gid = geoms_of_body(self._mj_model, self._left_foot_id)
         # self._right_foot_gid = geoms_of_body(self._mj_model, self._right_foot_id)
 
-        # # -------------------
-        # # Butterworth filter setup
-        # # -------------------
-        # self._ctrl_rate_hz = 1.0 / self.dt
-
-        # # Butterworth filter for target joint angles
-        # self._target_filter = BiquadFilter.create(
-        #     design_butterworth_biquad(
-        #         self._config.filters.target_cutoff_hz,
-        #         self._ctrl_rate_hz
-        #     ),
-        #     self.action_size
-        # )
-
+        self._push_target_body_id = self._mj_model.body(self._config.pushes.target_body).id
+    
     # ----------------------------------------------------------------------
     # Required abstract methods/properties
     # ----------------------------------------------------------------------
@@ -269,6 +287,8 @@ class CassieEnv(mjx_env.MjxEnv):
             "last_d_gains": jnp.zeros((self._mjx_model.nu,)),
             # Rolling observation history buffer of shape (history_len+1, obs_dim)
             "obs_history": obs_history,
+            # Random push state (control-step granularity)
+            "push_state": PushState.zeros(),
         }
 
         return mjx_env.State(
@@ -321,6 +341,13 @@ class CassieEnv(mjx_env.MjxEnv):
 
         pos_targets = self._action_to_jnt_targets(jnt_deltas_raw)  # The first 10 actions are joint angle deltas in [-1, 1]
 
+        # Decide and update random push state
+        push_state: PushState = state.info.get("push_state", PushState.zeros())
+        push_cfg = self._config.pushes if hasattr(self._config, "pushes") else None
+        push_enabled = (push_cfg is not None) and bool(push_cfg.enabled)
+
+        rng, push_state, force6_to_apply = self._update_push_state(rng, push_state, push_cfg, push_enabled)
+
         # Run PD control at simulator substep frequency (sim_dt):
         # Hold pos_targets and gains constant within this control interval,
         # but recompute torques each substep using the latest q, qdot.
@@ -328,7 +355,8 @@ class CassieEnv(mjx_env.MjxEnv):
             data_carry, _last_tau = carry
             tau = self._pd_control(data_carry, pos_targets, p_gains, d_gains)
             tau = jnp.clip(tau, self._torque_lowers, self._torque_uppers)
-            data_next = mjx_env.step(self._mjx_model, data_carry, tau, 1)
+            # Apply external force for this substep if a push is active
+            data_next = self._apply_external_force(data_carry, force6_to_apply, substeps=1, tau=tau)
             return (data_next, tau)
 
         data, torques = lax.fori_loop(
@@ -356,7 +384,7 @@ class CassieEnv(mjx_env.MjxEnv):
                         )
 
         # Scale each component by its configured weight
-        per_step_scaled = {k: per_step_raw[k] * self._config.reward_config.scales[k] for k in per_step_raw}
+        per_step_scaled = {k: per_step_raw[k] * self._config.reward_config.weights[k] for k in per_step_raw}
 
         # Per-step components are integrated over dt
         reward = jnp.sum(jnp.array(list(per_step_scaled.values()))) * self.dt
@@ -375,6 +403,8 @@ class CassieEnv(mjx_env.MjxEnv):
             "last_p_gains": p_gains,
             "last_d_gains": d_gains,
             "obs_history": new_hist,
+            # Push bookkeeping
+            "push_state": push_state,
         }
         return state.replace(
             data=data,
@@ -446,7 +476,7 @@ class CassieEnv(mjx_env.MjxEnv):
         """
         Computes reward components.
 
-        All rewards/costs are in [0, 1]. Their weights in self._config.reward_config.scales
+        All rewards/costs are in [0, 1]. Their weights in self._config.reward_config.weights
         determine their relative importance and sign.
         """
 
@@ -615,6 +645,110 @@ class CassieEnv(mjx_env.MjxEnv):
             may require the target to be outside the joint limits.
         """
         return self._standing_jnt_angles + joint_deltas_normalized * self._max_jnt_deltas
+
+    # ------------------------------------------------------------------
+    # Random push helpers (modular)
+    # ------------------------------------------------------------------
+
+    def _push_steps_from_seconds(self, seconds: float) -> int:
+        """Convert seconds to an integer number of control steps, at least 1 when seconds>0."""
+        if seconds <= 0:
+            return 0
+        steps = int(jnp.round(seconds / self.dt).item())
+        return max(steps, 1)
+
+    def _push_start_prob_per_step(self, start_rate_hz: float) -> float:
+        """Poisson-process start probability per control step for a given rate in Hz.
+
+        p = 1 - exp(-lambda * dt), invariant to discretization.
+        """
+        lam_dt = jnp.maximum(start_rate_hz * self.dt, 0.0)
+        return (1.0 - jnp.exp(-lam_dt)).item()
+
+    def _sample_push_force6(self, rng: jax.Array, push_cfg) -> tuple[jax.Array, jax.Array]:
+        """Sample a 6D wrench [fx, fy, fz, tx, ty, tz] in world frame given push config."""
+        rng1, rng2, rng3 = jax.random.split(rng, 3)
+        if getattr(push_cfg, "direction_mode", "horizontal") == "horizontal":
+            theta = jax.random.uniform(rng1, (), minval=0.0, maxval=2.0 * jnp.pi)
+            direction = jnp.array([jnp.cos(theta), jnp.sin(theta), 0.0])
+        else:
+            # Any-3D unit vector (sample from normal and normalize)
+            v = jax.random.normal(rng1, (3,))
+            norm = jnp.maximum(jnp.linalg.norm(v), 1e-6)
+            direction = v / norm
+
+        f_mag = jax.random.uniform(rng2, (), minval=push_cfg.force_range[0], maxval=push_cfg.force_range[1])
+        t_mag = jax.random.uniform(rng3, (), minval=push_cfg.torque_range[0], maxval=push_cfg.torque_range[1])
+        force = f_mag * direction
+        torque = jnp.array([0.0, 0.0, t_mag])  # By default apply torque about z
+        return rng3, jnp.concatenate([force, torque])
+
+    def _update_push_state(
+        self,
+        rng: jax.Array,
+        push_state: PushState,
+        push_cfg: Optional[config_dict.ConfigDict],
+        push_enabled: bool,
+    ) -> tuple[jax.Array, PushState, jax.Array]:
+        """Advance push state by one control step and return wrench to apply.
+
+        Returns (rng, new_push_state, force6_to_apply)
+        """
+        if not push_enabled:
+            # No pushes; decay any ongoing state to idle
+            zero = jnp.zeros((6,), dtype=jnp.float32)
+            return rng, PushState.zeros(), zero
+
+        # Convert invariant config into per-step quantities
+        start_p = self._push_start_prob_per_step(float(push_cfg.start_rate_hz))
+        min_interval_steps = self._push_steps_from_seconds(float(push_cfg.min_interval_s))
+        duration_steps = self._push_steps_from_seconds(float(push_cfg.duration_s))
+
+        steps_rem = push_state.steps_remaining
+        cooldown = push_state.cooldown
+        prev_force6 = push_state.force6
+
+        # Decide if we start a push this step
+        rng, key_start = jax.random.split(rng)
+        start_prob = jax.random.uniform(key_start, ())
+        can_start = jnp.logical_and(steps_rem == 0, cooldown == 0)
+        start_now = jnp.logical_and(can_start, start_prob < start_p)
+
+        # Sample new force if starting; otherwise keep previous
+        rng, new_force6 = lax.cond(
+            start_now,
+            lambda r: self._sample_push_force6(r, push_cfg),
+            lambda r: (r, prev_force6),
+            operand=rng,
+        )
+
+        # Update timers
+        new_steps = lax.select(start_now, jnp.array(duration_steps, dtype=jnp.int32), steps_rem)
+        active = new_steps > 0
+        steps_after = jnp.where(active, new_steps - 1, new_steps)
+
+        idle = jnp.logical_not(active)
+        cooldown_dec = jnp.maximum(cooldown - 1, 0)
+        new_cooldown = lax.select(
+            start_now,
+            jnp.array(min_interval_steps, dtype=jnp.int32),
+            jnp.where(idle, cooldown_dec, cooldown),
+        )
+
+        force6_to_apply = jnp.where(active, new_force6, jnp.zeros_like(new_force6))
+
+        return rng, PushState(steps_remaining=steps_after.astype(jnp.int32), cooldown=new_cooldown.astype(jnp.int32), force6=new_force6), force6_to_apply
+
+    def _apply_external_force(self, data: mjx.Data, force6: jax.Array, substeps: int, tau: jax.Array) -> mjx.Data:
+        """Apply a 6D wrench to the configured body for the given number of substeps and step the sim."""
+        # Build xfrc_applied array
+        xfrc = jnp.zeros((self._mjx_model.nbody, 6), dtype=data.xfrc_applied.dtype)
+        xfrc = xfrc.at[self._pelvis_id].set(force6)
+
+        def step_once(_: int, d: mjx.Data):
+            return mjx_env.step(self._mjx_model, d.replace(xfrc_applied=xfrc), tau, 1)
+
+        return lax.fori_loop(0, substeps, step_once, data)
 
     def _pd_control(
             self,

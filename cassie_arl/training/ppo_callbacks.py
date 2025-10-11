@@ -339,7 +339,7 @@ class VisualizePolicyCallback:
         return self.env.render(traj, camera="track", scene_option=scene_option, width=640*2, height=480)
 
     def _apply_overlays(self, frames, rollout: 'VisualizePolicyCallback.RolloutData', dt_frame: float):
-        reward_scales = {k: float(v) for k, v in self.env._config.reward_config.scales.items()}
+        reward_scales = {k: float(v) for k, v in self.env._config.reward_config.weights.items()}
         out_frames = []
         for idx, frame in enumerate(frames):
             frame_rgb = np.array(frame).copy()
