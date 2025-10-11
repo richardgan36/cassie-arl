@@ -11,10 +11,16 @@ from flax import struct
 from ml_collections import config_dict
 from mujoco_playground._src import mjx_env
 
-from cassie_arl.config.cassie_consts import *
 import cassie_arl.rl_env.math_utils as math_utils
-# from cassie_arl.rl_env.butterworth import BiquadFilter, design_butterworth_biquad
-
+from cassie_arl.config.cassie_consts import (
+    FOOT_OFFSET,
+    TARSUS_HIT_GROUND_THRESHOLD,
+    FALLING_THRESHOLD,
+    FOOT_CONTACT_THRESHOLD,
+    QPosIdx,
+    QVelIdx,
+    JntRangeIdx
+)
 
 script_dir = Path(__file__).parent
 CASSIE_SCENE_XML = script_dir.parent / "models" / "scene.xml"

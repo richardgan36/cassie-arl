@@ -10,35 +10,6 @@ FOOT_OFFSET = 0.057  # Height (m) of foot from ground when standing
 
 
 @dataclass(frozen=True)
-class StandingPose:
-    PELVIS_RPY: jax.Array = jnp.array([0.0, 0.0, 0.0])
-    MOTOR_ANGLES: jax.Array = jnp.array([
-        0.0,        # Left hip roll
-        0.0,        # Left hip yaw
-        0.4544,     # Left hip pitch
-        -1.21,      # Left knee
-        -1.643,     # Left foot
-        0.0,        # Right hip roll
-        0.0,        # Right hip yaw
-        0.4544,     # Right hip pitch
-        -1.21,      # Right knee
-        -1.643,     # Right foot
-    ])
-    MOTOR_TORQUES: jax.Array = jnp.array([  # TODO: replace with actual values
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-    ])
-
-
-@dataclass(frozen=True)
 class JntRangeIdx:
     MOTORS: jax.Array = jnp.array([
         1, 2, 3, 5, 11,

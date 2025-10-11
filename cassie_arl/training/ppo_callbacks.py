@@ -1,7 +1,7 @@
 """Callback functions passed into PPO training loop."""
 import dataclasses
 from dataclasses import dataclass, field
-from typing import List, Dict, Any, Callable, Optional
+from typing import List, Dict, Any, Callable
 from absl import logging
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -12,11 +12,15 @@ import matplotlib.animation as animation
 import mujoco as mj
 import jax
 import numpy as np
-import jax.numpy as jnp
 import cv2
+import imageio
 from brax.training import types
 
-from cassie_arl.config.cassie_consts import *
+from cassie_arl.config.cassie_consts import (
+    FOOT_OFFSET,
+    QPosIdx,
+    JntRangeIdx
+)
 
 
 logging.set_verbosity(logging.INFO)
