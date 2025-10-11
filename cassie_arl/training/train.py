@@ -47,7 +47,9 @@ ppo_training_params = {
     'restore_value_fn': True,
 }
 
-train_id = "parameterized_pd_2"  # Try to use PD control
+train_id = "parameterized_pd"  # Try to use PD control
+iteration = 3
+test_mode = False  # If True, run a short training for testing purposes
 env = CassieEnv()
 
 # JIT-wrapped env functions kept as local variables and passed into the visualization callback
@@ -62,24 +64,26 @@ network_factory = functools.partial(
     **dict(network_factory_params)
 )
 
-# # --- Shorten training for testing ---
-# ppo_training_params["num_evals"] = 4
-# ppo_training_params["episode_length"] = 5
-# ppo_training_params["num_envs"] = 1
-# ppo_training_params["num_minibatches"] = 4
-# ppo_training_params["batch_size"] = 2
-# ppo_training_params["unroll_length"] = 8
-# ppo_training_params["num_timesteps"] = 88
+if test_mode:
+    logging.info("\n----------\nRunning in test mode.\n----------")
+    # --- Shorten training for testing ---
+    ppo_training_params["num_evals"] = 2
+    ppo_training_params["episode_length"] = 5
+    ppo_training_params["num_envs"] = 1
+    ppo_training_params["num_minibatches"] = 4
+    ppo_training_params["batch_size"] = 2
+    ppo_training_params["unroll_length"] = 8
+    ppo_training_params["num_timesteps"] = 106
 
 logging.info("PPO training parameters:")
 logging.info(ppo_training_params)
 
-save_ckpt_dir = script_dir / "checkpoints" / f"{train_id}"
-restore_ckpt_path = script_dir / "checkpoints/parameterized_pd/000111411200"
+save_ckpt_dir = script_dir / "checkpoints" / f"{train_id}" / f"iter_{iteration:02d}"
+restore_ckpt_path = script_dir / "checkpoints/parameterized_pd_2/000032768000"
 
 # Instantiate callback objects
-progress_cb = ProgressCallback(ppo_training_params, script_dir, train_id, save_plot=True)
-viz_cb = VisualizePolicyCallback(env, jit_reset, jit_step, script_dir, train_id, run_every_n_calls=1)
+progress_cb = ProgressCallback(ppo_training_params, script_dir, train_id, iteration, save_plot=True)
+viz_cb = VisualizePolicyCallback(env, jit_reset, jit_step, script_dir, train_id, iteration, run_every_n_calls=1, test_mode=test_mode)
 
 train_fn = functools.partial(
     ppo.train, **dict(ppo_training_params),
@@ -87,11 +91,11 @@ train_fn = functools.partial(
     randomization_fn=randomizer,
     progress_fn=progress_cb,
     policy_params_fn=viz_cb,
-    save_checkpoint_path=save_ckpt_dir.as_posix(),
+    save_checkpoint_path=save_ckpt_dir.as_posix() if not test_mode else None,
     restore_checkpoint_path=restore_ckpt_path.as_posix()
 )
 
-if "save_checkpoint_path" in train_fn.keywords:
+if "save_checkpoint_path" in train_fn.keywords and train_fn.keywords["save_checkpoint_path"] is not None:
     logging.info(f"Checkpoints will be saved to {train_fn.keywords['save_checkpoint_path']}")
 
 # Start training

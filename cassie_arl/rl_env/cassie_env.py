@@ -60,37 +60,26 @@ def default_config() -> config_dict.ConfigDict:
         ctrl_dt=0.01,  # 100 Hz
         sim_dt=0.002,  # Match "timestep" in MJCF
         episode_length=1000,  # 10 seconds at ctrl_dt=0.01
-        # Number of previous steps to include in the observation history.
-        # Total stacked timesteps in obs = history_len + 1 (t plus history)
 
         # -------------------
         # Custom parameters
         # -------------------
 
+        # Number of previous steps to include in the observation history.
+        # Total stacked timesteps in obs = history_len + 1 (t plus history)
         history_len=2,
 
-        # PD control parameters
-
-        max_p_gain=5.0,  # Maximum Kp that can be learned by the agent
-        max_d_gain=0.5,  # Maximum Kd that can be learned by the agent
+        # --- PD control parameters ---
+        max_p_gain=8.0,  # Maximum Kp that can be learned by the agent
+        max_d_gain=0.8,  # Maximum Kd that can be learned by the agent
 
         # max_joint_delta_frac is the fraction of the total joint range
         # that the action can command as a delta from the standing pose.
-        max_joint_delta_frac=0.6,
+        max_joint_delta_frac=0.7,
 
-        # p_gain = jnp.array([
-        #     8, 4, 4, 10, 1,
-        #     8, 4, 4, 10, 1
-        # ]) / 4,
-
-        # d_gain = jnp.sqrt(jnp.array([  # Use rule of thumb Kd = 0.2 * sqrt(Kp)
-        #     8, 4, 4, 10, 1,
-        #     8, 4, 4, 10, 1
-        # ]) / 4) * 0.2,
-
-        # Reset noise configuration
+        # --- Reset noise configuration ---
         reset_noise_config=config_dict.create(
-            level=0.5,  # Set to 0.0 to disable noise.
+            level=1.2,  # Set to 0.0 to disable noise.
             scales=config_dict.create(
                 xy=jnp.array([-0.1, 0.1]),            # Additive
                 z=jnp.array([0, 0.05]),               # Additive
@@ -102,20 +91,18 @@ def default_config() -> config_dict.ConfigDict:
             ),
         ),
 
-        # Reward function configuration
-        # Except for the "fall" cost, which is a one-time cost, all reward weights
-        # are in [0, 1] and all cost weights are in [-1, 0].
+        # --- Reward function configuration ---
         reward_config=config_dict.create(
             scales=config_dict.create(
-                alive=2.0,
-                pelvis_height=-0.3,
-                pelvis_lin_vel=-0.3,
-                pelvis_ang_vel=-0.4,
-                pelvis_tilt=-0.3,
-                motor_ref_error=-0.8,
-                action_rate=-0.4,
+                alive=1.5,  # Initially 2.0 but reduced since other costs have been reduced
+                pelvis_height=-0.0,  # Initially -0.3, but after training, the agent discovers it can get high reward without tracking height closely
+                pelvis_lin_vel=-0.5,  # Initially -0.3 but increased to encourage stability
+                pelvis_ang_vel=-0.6,  # Initially -0.4 but increased to encourage stability
+                pelvis_tilt=-0.2,  # The standing pose found by the agent has a slight tilt, so this cost is reduced to avoid penalizing that too much
+                motor_ref_error=-0.0,  # Initially -0.8 but removed because the agent learnt a standing pose that is different from the reference pose
+                action_rate=-0.2,
                 torques=-0.05,
-                gain_rate=-0.1,
+                gain_rate=-0.0,  # Initially -0.1 to encourate constant gains but removed now that the agent has already learned this behavior 
             ),
         ),
 
@@ -166,7 +153,7 @@ class CassieEnv(mjx_env.MjxEnv):
         # Precomputed constants for rewards/costs (avoid repeated pow/div)
         # -------------------
         # Reference pelvis height
-        self._pelvis_height_ref = self._init_qpos[QPosIdx.BASE_HEIGHT]
+        self._pelvis_height_ref = 0.985
 
         # Inverse-squared scales (1 / scale^2) for various costs
         self._inv_height_err_scale_sq = jnp.array(1.0 / (0.02 ** 2))
@@ -175,8 +162,13 @@ class CassieEnv(mjx_env.MjxEnv):
         self._inv_tilt_err_scale_sq = jnp.array(1.0 / (0.17 ** 2))
         self._inv_motor_ref_err_scale_sq = jnp.array(1.0 / (0.08 ** 2))
 
-        # Action rate scale depends on control dt
-        self._inv_action_rate_scale_sq = jnp.array(1.0 / ((3.14 * self.dt) ** 2))
+        # Action-rate normalization per joint: "full allowed delta traversed in ~0.25s"
+        # Per-step scale = max_delta / (0.25 / dt) = max_delta / steps_per_quarter_sec
+        steps_per_quarter_sec = jnp.maximum(0.25 / self.dt, 1.0)
+        per_step_target_scale = self._max_jnt_deltas / steps_per_quarter_sec  # (10,)
+        # Guard against tiny scales to avoid blow-ups
+        per_step_target_scale = jnp.maximum(per_step_target_scale, 1e-6)
+        self._inv_action_rate_scales_sq = 1.0 / (per_step_target_scale ** 2)  # (10,)
 
         # Torque scale is per-actuator; use upper bounds (assumed symmetric)
         # cost ~ mean((tau / (ub/2))^2) == mean((tau^2) * (2/ub)^2)
@@ -491,7 +483,8 @@ class CassieEnv(mjx_env.MjxEnv):
     def _cost_pelvis_height(self, data: mjx.Data) -> jax.Array:
         """Cost for pelvis height deviation from standing height."""
         pelvis_height = data.qpos[QPosIdx.BASE_HEIGHT]  # Shape (1,)
-        height_err = pelvis_height - 0.985  # Hardcoded, determined from animation
+        # Use reference standing height computed in _post_init
+        height_err = pelvis_height - self._pelvis_height_ref
         # (err / s)^2 == err^2 * (1/s^2)
         cost = (height_err[0] ** 2) * self._inv_height_err_scale_sq
         return jnp.clip(cost, 0.0, 1.0)
@@ -537,9 +530,9 @@ class CassieEnv(mjx_env.MjxEnv):
         
         The 'action' here is interpreted as the target joint angles.
         """
-        # If action moves through the full range in quarter of a second, incur max cost.
-        act_rate = pos_targets - last_pos_targets
-        cost = jnp.mean((act_rate ** 2)) * self._inv_action_rate_scale_sq
+        # Normalize per joint by the "allowed" per-step change and average
+        act_rate = pos_targets - last_pos_targets  # (10,)
+        cost = jnp.mean((act_rate ** 2) * self._inv_action_rate_scales_sq)
         return jnp.clip(cost, 0.0, 1.0)
     
     def _cost_torques(self, torques: jax.Array) -> jax.Array:

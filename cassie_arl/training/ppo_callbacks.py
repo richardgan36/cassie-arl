@@ -29,12 +29,14 @@ class ProgressCallback:
             training_params: dict,
             script_dir: Path,
             train_id: str,
+            iteration: int,
             save_plot: bool = True
         ):
         self.training_params = training_params
         self.script_dir = script_dir
-        self.train_id = train_id
+        self.iteration = iteration
         self.save_plot = save_plot
+        self.save_dir = self.script_dir / "progress" / train_id
         self.x_data = []
         self.y_data = []
         self.y_dataerr = []
@@ -72,8 +74,7 @@ class ProgressCallback:
             plt.pause(0.005)  # Small pause to update the figure
             return
 
-        timestamp_day = datetime.now().strftime("%Y-%m-%d")
-        save_path = self.script_dir / "progress" / self.train_id / f"progress.png"
+        save_path = self.save_dir / f"progress_{self.iteration:02d}.png"
         save_path.parent.mkdir(parents=True, exist_ok=True)
         plt.savefig(str(save_path), dpi=150, bbox_inches="tight")
 
@@ -117,14 +118,43 @@ class VisualizePolicyCallback:
         cumulative_reward: float = 0.0
 
     # ------------------------------- Init ----------------------------------------
-    def __init__(self, env, jit_reset, jit_step, script_dir: Path, train_id: str, run_every_n_calls: int = 1):
+    def __init__(
+            self,
+            env,
+            jit_reset,
+            jit_step,
+            script_dir: Path,
+            train_id: str,
+            iteration: int,
+            run_every_n_calls: int = 1,
+            test_mode=False,
+            video_fps: int = 30,
+            video_scale: float = 1.0,
+            video_crf: int = 22,  # lower = better quality, 18-28 reasonable range
+            video_pix_fmt: str = "yuv420p",  # Options: 'yuv420p' (more compatible), 'yuv422p', 'yuv444p' (less compression)
+            video_preset: str = "veryfast"  
+    ):
         self.env = env
         self.jit_reset = jit_reset
         self.jit_step = jit_step
         self.script_dir = script_dir
-        self.train_id = train_id
         self.run_every_n_calls = run_every_n_calls  # frequency control
+        self.test_mode = test_mode  # If True, save animation and plots to a test directory
         self._call_count = 0
+
+        # Video settings
+        self.video_fps = max(1, int(video_fps))
+        self.video_scale = float(video_scale)
+        self.video_crf = int(video_crf)
+        self.video_pix_fmt = str(video_pix_fmt)
+        self.video_preset = str(video_preset)
+
+        # Centralized directory for all visualization artifacts
+        # Keeping the same path as before for backward compatibility
+        self.ani_save_dir = self.script_dir / "simulation" / train_id / f"iter_{iteration:02d}"
+        if self.test_mode:
+            self.ani_save_dir = self.ani_save_dir / "test"
+        self.ani_save_dir.mkdir(parents=True, exist_ok=True)
 
         # Extension points (ordered). Each receives (current_step, rollout_data, context_dict)
         self.post_processors: List[Callable[[int, 'VisualizePolicyCallback.RolloutData', Dict[str, Any]], None]] = [
@@ -258,20 +288,44 @@ class VisualizePolicyCallback:
 
     # ----------------------------- Rendering & Overlays --------------------------
     def _render_and_save_artifacts(self, current_step: int, rollout: 'VisualizePolicyCallback.RolloutData', context: Dict[str, Any]):
+        # Render frames first
         frames = self._render_frames(rollout.traj)
-        frames_overlay = self._apply_overlays(frames, rollout)
-        base_name, ani_save_dir, ani_save_path, dt_frame = self._save_video(current_step, frames_overlay)
-        # Plots
-        self._plot_reward_components(rollout.reward_records, base_name, ani_save_dir, dt_frame)
-        self._plot_torques(rollout.torque_history, base_name, ani_save_dir, dt_frame)
-        self._plot_actions(rollout.actions_history, base_name, ani_save_dir, dt_frame)
-        self._plot_gains(rollout.p_gain_history, rollout.d_gain_history, base_name, ani_save_dir, dt_frame)
+        # Subsample frames to target FPS to cut encoding time and memory
+        ctrl_dt = float(self.env._config.ctrl_dt)
+        fps_in = max(1.0 / ctrl_dt, 1.0)
+        stride = max(1, int(round(fps_in / float(self.video_fps))))
+        if stride > 1:
+            idxs = list(range(0, len(frames), stride))
+            frames = [frames[i] for i in idxs]
+            rollout_sub = self.RolloutData(
+                traj=[rollout.traj[i] for i in idxs if i < len(rollout.traj)],
+                reward_records=[rollout.reward_records[i] for i in idxs if i < len(rollout.reward_records)],
+                foot_infos=[rollout.foot_infos[i] for i in idxs if i < len(rollout.foot_infos)],
+                torque_history=[rollout.torque_history[i] for i in idxs if i < len(rollout.torque_history)],
+                actions_history=[rollout.actions_history[i] for i in idxs if i < len(rollout.actions_history)],
+                motor_qpos_history=[rollout.motor_qpos_history[i] for i in idxs if i < len(rollout.motor_qpos_history)],
+                target_history=[rollout.target_history[i] for i in idxs if i < len(rollout.target_history)],
+                p_gain_history=[rollout.p_gain_history[i] for i in idxs if i < len(rollout.p_gain_history)],
+                d_gain_history=[rollout.d_gain_history[i] for i in idxs if i < len(rollout.d_gain_history)],
+                observation_history=[rollout.observation_history[i] for i in idxs if i < len(rollout.observation_history)],
+                cumulative_reward=rollout.cumulative_reward,
+            )
+        else:
+            rollout_sub = rollout
+        # Effective dt between video frames
+        dt_video = ctrl_dt * stride
+        frames_overlay = self._apply_overlays(frames, rollout_sub, dt_video)
+        base_name, ani_save_path, _ = self._save_video(current_step, frames_overlay, dt_video)
+        # Plots use simulation dt (not video dt)
+        self._plot_reward_components(rollout.reward_records, base_name, ctrl_dt)
+        self._plot_torques(rollout.torque_history, base_name, ctrl_dt)
+        self._plot_actions(rollout.actions_history, base_name, ctrl_dt)
+        self._plot_gains(rollout.p_gain_history, rollout.d_gain_history, base_name, ctrl_dt)
         self._plot_joint_angles(
             rollout.motor_qpos_history,
             rollout.target_history,
             base_name,
-            ani_save_dir,
-            dt_frame,
+            ctrl_dt,
         )
         logging.info(f"Saved rollout video to {ani_save_path}")
 
@@ -284,7 +338,7 @@ class VisualizePolicyCallback:
         scene_option.flags[mj.mjtVisFlag.mjVIS_PERTFORCE] = False
         return self.env.render(traj, camera="track", scene_option=scene_option, width=640*2, height=480)
 
-    def _apply_overlays(self, frames, rollout: 'VisualizePolicyCallback.RolloutData'):
+    def _apply_overlays(self, frames, rollout: 'VisualizePolicyCallback.RolloutData', dt_frame: float):
         reward_scales = {k: float(v) for k, v in self.env._config.reward_config.scales.items()}
         out_frames = []
         for idx, frame in enumerate(frames):
@@ -302,7 +356,7 @@ class VisualizePolicyCallback:
             for li, line in enumerate(left_lines):
                 self._put_text(frame_rgb, line, (10, 30 + li * 30), color=(255, 255, 255), font_scale=font_scale, thickness=thickness)
             fw = frame_rgb.shape[1]
-            right_x = fw - 480
+            right_x = fw - 390
             for ri, line in enumerate(right_lines):
                 # Use white for labels, green for positive rewards, red for negative rewards
                 if (ri < 3) or (':' not in line):
@@ -314,6 +368,10 @@ class VisualizePolicyCallback:
                     except Exception:
                         color = (255, 255, 255)
                 self._put_text(frame_rgb, line, (right_x, 30 + ri * 30), color=color, font_scale=font_scale, thickness=thickness)
+            # Simulation time (bottom-left)
+            time_text = f"t = {idx * dt_frame:.2f} s"
+            fh = frame_rgb.shape[0]
+            self._put_text(frame_rgb, time_text, (10, fh - 10), color=(255, 255, 255), font_scale=font_scale, thickness=thickness)
             out_frames.append(frame_rgb)
         return out_frames
 
@@ -384,7 +442,7 @@ class VisualizePolicyCallback:
         lines = [
             f"Step Reward: {reward_record.step_reward:.4f}",
             f"Cumulative: {reward_record.cumulative_reward:.4f}",
-            "--- Raw Rewards (signed, unweighted) ---",
+            "--- Rewards ---",
         ]
         for name, weighted_value in reward_record.components.items():
             scale = reward_scales.get(name, 1.0)
@@ -393,36 +451,101 @@ class VisualizePolicyCallback:
         return lines
 
     # ----------------------------- Saving Artifacts ------------------------------
-    def _save_video(self, current_step: int, frames_overlay: List[np.ndarray]):
-        dt_frame = float(self.env._config.ctrl_dt)
-        fps = float(1.0 / dt_frame)
-        ani_save_dir = self.script_dir / "simulation" / f"{self.train_id}"
-        ani_save_dir.mkdir(parents=True, exist_ok=True)
-        # Create a pixel-perfect figure to avoid interpolation blur
-        h, w = frames_overlay[0].shape[:2]
-        dpi = 100
-        fig, ax = plt.subplots(figsize=(w / dpi, h / dpi), dpi=dpi)
-        ax.axis("off")
-        im = ax.imshow(frames_overlay[0], interpolation='nearest')
+    def _save_video(self, current_step: int, frames_overlay: List[np.ndarray], dt_frame: float):
+        """Save frames efficiently using streaming ffmpeg via imageio if available.
 
-        def update(frame):
-            im.set_data(frame)
-            return [im]
+        - Caller provides dt_frame (may be subsampled).
+        - Returns base name, path, and control dt (for plots).
+        """
+        # Optional downscale
+        if abs(self.video_scale - 1.0) > 1e-6:
+            scaled = []
+            for fr in frames_overlay:
+                h, w = fr.shape[:2]
+                nw = max(1, int(round(w * self.video_scale)))
+                nh = max(1, int(round(h * self.video_scale)))
+                scaled.append(cv2.resize(fr, (nw, nh), interpolation=cv2.INTER_AREA))
+            frames_overlay = scaled
 
-        ani = animation.FuncAnimation(fig, update, frames=frames_overlay, interval=1000 / fps, blit=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         base_name = f"rollout_step{current_step}-{timestamp}"
-        ani_save_path = ani_save_dir / f"{base_name}.mp4"
-        # Prefer full-chroma to reduce red text blur; fall back if unsupported
+        ani_save_path = self.ani_save_dir / f"{base_name}.mp4"
+
+        # Try imageio (streaming, low-memory). Fall back to OpenCV/Matplotlib if missing.
         try:
-            ani.save(ani_save_path, writer="ffmpeg", fps=fps, dpi=dpi,
-                     extra_args=['-vcodec', 'libx264', '-pix_fmt', 'yuv444p', '-crf', '18'])
+            import importlib
+            imageio = importlib.import_module('imageio')
+            fps_out = float(1.0 / max(dt_frame, 1e-6))
+            # Prefer explicit pixelformat kwarg (newer imageio) to avoid duplicate -pix_fmt warnings.
+            try:
+                writer = imageio.get_writer(
+                    str(ani_save_path),
+                    fps=fps_out,
+                    codec='libx264',
+                    format='ffmpeg',
+                    pixelformat=self.video_pix_fmt,
+                    ffmpeg_params=['-preset', self.video_preset, '-crf', str(self.video_crf)],
+                )
+            except TypeError:
+                # Older imageio versions don't support pixelformat kwarg.
+                writer = imageio.get_writer(
+                    str(ani_save_path),
+                    fps=fps_out,
+                    codec='libx264',
+                    format='ffmpeg',
+                    ffmpeg_params=['-pix_fmt', self.video_pix_fmt, '-preset', self.video_preset, '-crf', str(self.video_crf)],
+                )
+            for fr in frames_overlay:
+                if fr.dtype != np.uint8:
+                    fr = fr.astype(np.uint8)
+                writer.append_data(fr)
+            writer.close()
         except Exception as e:
-            logging.warning(f"FFmpeg yuv444p failed ({e}); falling back to yuv420p.")
-            ani.save(ani_save_path, writer="ffmpeg", fps=fps, dpi=dpi,
-                     extra_args=['-vcodec', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '18'])
-        plt.close(fig)
-        return base_name, ani_save_dir, ani_save_path, dt_frame
+            logging.warning(f"imageio/ffmpeg streaming failed ({e}); trying OpenCV VideoWriter.")
+            # OpenCV fallback writer (no GUI, streamed)
+            try:
+                fps_out = float(1.0 / max(dt_frame, 1e-6))
+                h, w = frames_overlay[0].shape[:2]
+                # Ensure even dimensions for encoders
+                if (w % 2) or (h % 2):
+                    w_even = w + (w % 2)
+                    h_even = h + (h % 2)
+                    frames_overlay = [cv2.resize(fr, (w_even, h_even), interpolation=cv2.INTER_AREA) for fr in frames_overlay]
+                    h, w = h_even, w_even
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # widely supported
+                writer = cv2.VideoWriter(str(ani_save_path), fourcc, fps_out, (w, h))
+                if not writer.isOpened():
+                    raise RuntimeError("cv2.VideoWriter failed to open output file")
+                for fr in frames_overlay:
+                    if fr.dtype != np.uint8:
+                        fr = fr.astype(np.uint8)
+                    # Convert RGB->BGR for OpenCV
+                    bgr = cv2.cvtColor(fr, cv2.COLOR_RGB2BGR)
+                    writer.write(bgr)
+                writer.release()
+            except Exception as e2:
+                logging.warning(f"OpenCV VideoWriter failed ({e2}); falling back to Matplotlib animation as last resort.")
+                # Minimal Matplotlib fallback
+                h, w = frames_overlay[0].shape[:2]
+                dpi = 100
+                fig, ax = plt.subplots(figsize=(w / dpi, h / dpi), dpi=dpi)
+                ax.axis("off")
+                im = ax.imshow(frames_overlay[0], interpolation='nearest')
+
+                def update(frame):
+                    im.set_data(frame)
+                    return [im]
+
+                fps_out = float(1.0 / max(dt_frame, 1e-6))
+                ani = animation.FuncAnimation(fig, update, frames=frames_overlay, interval=1000 / fps_out, blit=True)
+                try:
+                    ani.save(ani_save_path, writer="ffmpeg", fps=fps_out, dpi=dpi,
+                             extra_args=['-vcodec', 'libx264', '-pix_fmt', self.video_pix_fmt, '-preset', self.video_preset, '-crf', str(self.video_crf)])
+                finally:
+                    plt.close(fig)
+
+        # Return control dt (not video frame dt) so plots align with sim steps
+        return base_name, ani_save_path, float(self.env._config.ctrl_dt)
 
     def _put_text(self, img: np.ndarray, text: str, org: tuple[int, int], color: tuple[int, int, int], font_scale: float = 0.8, thickness: int = 2):
         """Draw readable text: solid dark background + outline to reduce blur.
@@ -445,7 +568,7 @@ class VisualizePolicyCallback:
         # Foreground text
         cv2.putText(img, text, org, font, font_scale, color, thickness, lineType=cv2.LINE_8)
 
-    def _plot_torques(self, torque_history: List[np.ndarray], base_name: str, save_dir: Path, dt_frame: float):
+    def _plot_torques(self, torque_history: List[np.ndarray], base_name: str, dt_frame: float):
         if len(torque_history) == 0:
             logging.warning("No torque data collected; episode ended before first step?")
             return
@@ -459,29 +582,41 @@ class VisualizePolicyCallback:
                 "Left Hip Roll", "Left Hip Yaw", "Left Hip Pitch", "Left Knee", "Left Foot",
                 "Right Hip Roll", "Right Hip Yaw", "Right Hip Pitch", "Right Knee", "Right Foot"
             ]
+            torque_lowers = np.array(self.env._torque_lowers)
+            torque_uppers = np.array(self.env._torque_uppers)
             for row, j in enumerate(range(0, 5)):
                 axt_left = axes_ft[row * cols]
                 axt_left.plot(time_axis, torque_arr[:, j], color='tab:purple', linewidth=1.2)
+
+                # Add horizontal lines for target limits
+                axt_left.axhline(torque_lowers[j], color='tab:red', linestyle='--', linewidth=1, label='Torque lower limit' if row == 0 else "")
+                axt_left.axhline(torque_uppers[j], color='tab:red', linestyle='--', linewidth=1, label='Torque upper limit' if row == 0 else "")
+
                 axt_left.set_title(joint_names[j])
                 axt_left.set_ylabel('Torque (Nm)')
                 axt_left.grid(alpha=0.3)
             for row, j in enumerate(range(5, 10)):
                 axt_right = axes_ft[row * cols + 1]
                 axt_right.plot(time_axis, torque_arr[:, j], color='tab:purple', linewidth=1.2)
+
+                # Add horizontal lines for target limits
+                axt_right.axhline(torque_lowers[j], color='tab:red', linestyle='--', linewidth=1, label='Torque lower limit' if row == 0 else "")
+                axt_right.axhline(torque_uppers[j], color='tab:red', linestyle='--', linewidth=1, label='Torque upper limit' if row == 0 else "")
+
                 axt_right.set_title(joint_names[j])
                 axt_right.grid(alpha=0.3)
             axes_ft[8].set_xlabel('Time (s)')
             axes_ft[9].set_xlabel('Time (s)')
             fig_t.suptitle('Applied PD Torques per Joint')
             fig_t.tight_layout(rect=[0, 0, 1, 0.96])
-            torque_plot_path = save_dir / f"{base_name}_torques.png"
+            torque_plot_path = self.ani_save_dir / f"{base_name}_torques.png"
             fig_t.savefig(torque_plot_path, dpi=160)
             plt.close(fig_t)
             logging.info(f"Saved torque montage to {torque_plot_path}")
         except Exception as e:
             logging.exception(f"Failed generating/saving torque montage: {e}")
 
-    def _plot_actions(self, actions_history: List[np.ndarray], base_name: str, save_dir: Path, dt_frame: float):
+    def _plot_actions(self, actions_history: List[np.ndarray], base_name: str, dt_frame: float):
         if len(actions_history) == 0:
             logging.warning("No action data collected; episode ended before first step?")
             return
@@ -512,7 +647,7 @@ class VisualizePolicyCallback:
             axes_fa[9].set_xlabel('Time (s)')
             fig_a.suptitle('Normalized Joint Actions')
             fig_a.tight_layout(rect=[0, 0, 1, 0.96])
-            actions_plot_path = save_dir / f"{base_name}_actions.png"
+            actions_plot_path = self.ani_save_dir / f"{base_name}_actions.png"
             fig_a.savefig(actions_plot_path, dpi=160)
             plt.close(fig_a)
             logging.info(f"Saved actions montage to {actions_plot_path}")
@@ -524,7 +659,6 @@ class VisualizePolicyCallback:
         p_gain_history: List[np.ndarray],
         d_gain_history: List[np.ndarray],
         base_name: str,
-        save_dir: Path,
         dt_frame: float,
     ):
         if len(p_gain_history) == 0 or len(d_gain_history) == 0:
@@ -557,7 +691,7 @@ class VisualizePolicyCallback:
             # Only one legend is needed; keep it on Kp subplot
             fig.suptitle('Learned PD Gains Over Time')
             fig.tight_layout(rect=[0, 0, 1, 0.95])
-            gains_plot_path = save_dir / f"{base_name}_pd_gains.png"
+            gains_plot_path = self.ani_save_dir / f"{base_name}_pd_gains.png"
             fig.savefig(gains_plot_path, dpi=160)
             plt.close(fig)
             logging.info(f"Saved PD gains figure to {gains_plot_path}")
@@ -568,7 +702,6 @@ class VisualizePolicyCallback:
         self,
         reward_records: List['VisualizePolicyCallback.RewardRecord'],
         base_name: str,
-        save_dir: Path,
         dt_frame: float,
     ):
         """Plot per-step weighted reward components over time (excluding 'alive')."""
@@ -605,7 +738,7 @@ class VisualizePolicyCallback:
             ax_rc.grid(alpha=0.3)
             ax_rc.legend(frameon=False, fontsize=8, ncol=2 if len(all_keys) > 8 else 1)
             fig_rc.tight_layout()
-            reward_plot_path = save_dir / f"{base_name}_reward_components.png"
+            reward_plot_path = self.ani_save_dir / f"{base_name}_reward_components.png"
             fig_rc.savefig(reward_plot_path, dpi=160)
             plt.close(fig_rc)
             logging.info(f"Saved reward components plot to {reward_plot_path}")
@@ -617,7 +750,6 @@ class VisualizePolicyCallback:
         motor_qpos_history: List[np.ndarray],
         target_history: List[np.ndarray],
         base_name: str,
-        save_dir: Path,
         dt_frame: float,
     ):
         """Plot actual joint angles, PD targets, joint limits, and standing (neutral) pose."""
@@ -695,7 +827,7 @@ class VisualizePolicyCallback:
             fig_j.suptitle('Joint Angles: Actual vs PD Targets (with Limits & Standing Pose)')
             fig_j.tight_layout(rect=[0, 0, 1, 0.96])
 
-            joint_plot_path = save_dir / f"{base_name}_joint_angles.png"
+            joint_plot_path = self.ani_save_dir / f"{base_name}_joint_angles.png"
             fig_j.savefig(joint_plot_path, dpi=160)
             plt.close(fig_j)
             logging.info(f"Saved joint angle montage to {joint_plot_path}")
