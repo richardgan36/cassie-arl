@@ -13,8 +13,10 @@ import mujoco as mj
 import jax
 import numpy as np
 import cv2
-import imageio
+import imageio.v2 as imageio
 from brax.training import types
+import io
+import contextlib
 
 from cassie_arl.config.cassie_consts import (
     FOOT_OFFSET,
@@ -147,11 +149,11 @@ class VisualizePolicyCallback:
         self._call_count = 0
 
         # Video settings
-        self.video_fps = max(1, int(video_fps))
-        self.video_scale = float(video_scale)
-        self.video_crf = int(video_crf)
-        self.video_pix_fmt = str(video_pix_fmt)
-        self.video_preset = str(video_preset)
+        self.video_fps = video_fps
+        self.video_scale = video_scale
+        self.video_crf = video_crf
+        self.video_pix_fmt = video_pix_fmt
+        self.video_preset = video_preset
 
         # Centralized directory for all visualization artifacts
         # Keeping the same path as before for backward compatibility
@@ -292,34 +294,15 @@ class VisualizePolicyCallback:
 
     # ----------------------------- Rendering & Overlays --------------------------
     def _render_and_save_artifacts(self, current_step: int, rollout: 'VisualizePolicyCallback.RolloutData', context: Dict[str, Any]):
-        # Render frames first
-        frames = self._render_frames(rollout.traj)
         # Subsample frames to target FPS to cut encoding time and memory
         ctrl_dt = float(self.env._config.ctrl_dt)
         fps_in = max(1.0 / ctrl_dt, 1.0)
         stride = max(1, int(round(fps_in / float(self.video_fps))))
-        if stride > 1:
-            idxs = list(range(0, len(frames), stride))
-            frames = [frames[i] for i in idxs]
-            rollout_sub = self.RolloutData(
-                traj=[rollout.traj[i] for i in idxs if i < len(rollout.traj)],
-                reward_records=[rollout.reward_records[i] for i in idxs if i < len(rollout.reward_records)],
-                foot_infos=[rollout.foot_infos[i] for i in idxs if i < len(rollout.foot_infos)],
-                torque_history=[rollout.torque_history[i] for i in idxs if i < len(rollout.torque_history)],
-                actions_history=[rollout.actions_history[i] for i in idxs if i < len(rollout.actions_history)],
-                motor_qpos_history=[rollout.motor_qpos_history[i] for i in idxs if i < len(rollout.motor_qpos_history)],
-                target_history=[rollout.target_history[i] for i in idxs if i < len(rollout.target_history)],
-                p_gain_history=[rollout.p_gain_history[i] for i in idxs if i < len(rollout.p_gain_history)],
-                d_gain_history=[rollout.d_gain_history[i] for i in idxs if i < len(rollout.d_gain_history)],
-                observation_history=[rollout.observation_history[i] for i in idxs if i < len(rollout.observation_history)],
-                cumulative_reward=rollout.cumulative_reward,
-            )
-        else:
-            rollout_sub = rollout
+        idxs = list(range(0, len(rollout.traj), stride)) if len(rollout.traj) > 0 else []
         # Effective dt between video frames
         dt_video = ctrl_dt * stride
-        frames_overlay = self._apply_overlays(frames, rollout_sub, dt_video)
-        base_name, ani_save_path, _ = self._save_video(current_step, frames_overlay, dt_video)
+        # Stream render + overlay + encode to avoid holding all frames in memory
+        base_name, ani_save_path, _ = self._save_video_streaming(current_step, rollout, idxs, dt_video)
         # Plots use simulation dt (not video dt)
         self._plot_reward_components(rollout.reward_records, base_name, ctrl_dt)
         self._plot_torques(rollout.torque_history, base_name, ctrl_dt)
@@ -331,7 +314,8 @@ class VisualizePolicyCallback:
             base_name,
             ctrl_dt,
         )
-        logging.info(f"Saved rollout video to {ani_save_path}")
+        if ani_save_path is not None:
+            logging.info(f"Saved rollout video to {ani_save_path}")
 
     def _render_frames(self, traj: List[Any]):
         scene_option = mj.MjvOption()
@@ -455,101 +439,130 @@ class VisualizePolicyCallback:
         return lines
 
     # ----------------------------- Saving Artifacts ------------------------------
-    def _save_video(self, current_step: int, frames_overlay: List[np.ndarray], dt_frame: float):
-        """Save frames efficiently using streaming ffmpeg via imageio if available.
+    def _save_video_streaming(self, current_step: int, rollout: 'VisualizePolicyCallback.RolloutData', idxs: List[int], dt_frame: float):
+        """Render, overlay, and encode video in a streaming fashion to avoid large memory spikes.
 
-        - Caller provides dt_frame (may be subsampled).
-        - Returns base name, path, and control dt (for plots).
+        Returns base_name, path, and control dt (for plots).
         """
-        # Optional downscale
-        if abs(self.video_scale - 1.0) > 1e-6:
-            scaled = []
-            for fr in frames_overlay:
-                h, w = fr.shape[:2]
-                nw = max(1, int(round(w * self.video_scale)))
-                nh = max(1, int(round(h * self.video_scale)))
-                scaled.append(cv2.resize(fr, (nw, nh), interpolation=cv2.INTER_AREA))
-            frames_overlay = scaled
-
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         base_name = f"rollout_step{current_step}-{timestamp}"
         ani_save_path = self.ani_save_dir / f"{base_name}.mp4"
 
-        # Try imageio (streaming, low-memory). Fall back to OpenCV/Matplotlib if missing.
+        if len(idxs) == 0:
+            logging.warning("No indices to render; skipping video.")
+            return base_name, None, self.env._config.ctrl_dt
+
+        # Pre-create scene option once
+        scene_option = mj.MjvOption()
+        scene_option.geomgroup[2] = True
+        scene_option.geomgroup[3] = False
+        scene_option.flags[mj.mjtVisFlag.mjVIS_CONTACTPOINT] = True
+        scene_option.flags[mj.mjtVisFlag.mjVIS_TRANSPARENT] = False
+        scene_option.flags[mj.mjtVisFlag.mjVIS_PERTFORCE] = False
+
+        # Helper to render a single frame for a given state index
+        def render_one(i: int) -> np.ndarray:
+            # env.render accepts a trajectory; pass single-element list and take first image
+            # Silence tqdm or other progress logging inside render
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                fr_list = self.env.render([rollout.traj[i]], camera="track", scene_option=scene_option, width=640*2, height=480)
+            return np.array(fr_list[0])
+
+        # First frame to determine size and possibly scale policy
+        fr0 = render_one(idxs[0])
+        # Heuristic: auto downscale if resolution*frames is too large and user didn't set scale < 1
+        auto_scale = 1.0
         try:
-            import importlib
-            imageio = importlib.import_module('imageio')
-            fps_out = float(1.0 / max(dt_frame, 1e-6))
-            # Prefer explicit pixelformat kwarg (newer imageio) to avoid duplicate -pix_fmt warnings.
-            try:
-                writer = imageio.get_writer(
-                    str(ani_save_path),
-                    fps=fps_out,
-                    codec='libx264',
-                    format='ffmpeg',
-                    pixelformat=self.video_pix_fmt,
-                    ffmpeg_params=['-preset', self.video_preset, '-crf', str(self.video_crf)],
-                )
-            except TypeError:
-                # Older imageio versions don't support pixelformat kwarg.
-                writer = imageio.get_writer(
-                    str(ani_save_path),
-                    fps=fps_out,
-                    codec='libx264',
-                    format='ffmpeg',
-                    ffmpeg_params=['-pix_fmt', self.video_pix_fmt, '-preset', self.video_preset, '-crf', str(self.video_crf)],
-                )
-            for fr in frames_overlay:
+            h0, w0 = fr0.shape[:2]
+            est_frames = len(idxs)
+            est_megapixels = (h0 * w0 * est_frames) / 1e6
+            if self.video_scale == 1.0 and est_megapixels > 400:  # ~400 MP threshold (~400MB of raw RGB)
+                auto_scale = 0.5
+                logging.info(f"Auto-downscaling video by 0.5x due to size: {w0}x{h0}x{est_frames}")
+        except Exception:
+            h0, w0 = fr0.shape[:2]
+
+        scale = self.video_scale * auto_scale
+        if abs(scale - 1.0) > 1e-6:
+            nh = max(1, int(round(h0 * scale)))
+            nw = max(1, int(round(w0 * scale)))
+        else:
+            nh, nw = h0, w0
+
+        fps_out = float(1.0 / max(dt_frame, 1e-6))
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")  # portable
+        writer = cv2.VideoWriter(str(ani_save_path), fourcc, fps_out, (nw, nh))
+        if not writer.isOpened():
+            logging.error("Failed to open video writer")
+            return base_name, None, self.env._config.ctrl_dt
+
+        try:
+            reward_scales = {k: float(v) for k, v in self.env._config.reward_config.weights.items()}
+            for fi, i in enumerate(idxs):
+                # Render
+                fr = fr0 if (fi == 0) else render_one(i)
+                # Ensure uint8 RGB
                 if fr.dtype != np.uint8:
-                    fr = fr.astype(np.uint8)
-                writer.append_data(fr)
-            writer.close()
-        except Exception as e:
-            logging.warning(f"imageio/ffmpeg streaming failed ({e}); trying OpenCV VideoWriter.")
-            # OpenCV fallback writer (no GUI, streamed)
-            try:
-                fps_out = float(1.0 / max(dt_frame, 1e-6))
-                h, w = frames_overlay[0].shape[:2]
-                # Ensure even dimensions for encoders
-                if (w % 2) or (h % 2):
-                    w_even = w + (w % 2)
-                    h_even = h + (h % 2)
-                    frames_overlay = [cv2.resize(fr, (w_even, h_even), interpolation=cv2.INTER_AREA) for fr in frames_overlay]
-                    h, w = h_even, w_even
-                fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # widely supported
-                writer = cv2.VideoWriter(str(ani_save_path), fourcc, fps_out, (w, h))
-                if not writer.isOpened():
-                    raise RuntimeError("cv2.VideoWriter failed to open output file")
-                for fr in frames_overlay:
-                    if fr.dtype != np.uint8:
-                        fr = fr.astype(np.uint8)
-                    # Convert RGB->BGR for OpenCV
-                    bgr = cv2.cvtColor(fr, cv2.COLOR_RGB2BGR)
-                    writer.write(bgr)
-                writer.release()
-            except Exception as e2:
-                logging.warning(f"OpenCV VideoWriter failed ({e2}); falling back to Matplotlib animation as last resort.")
-                # Minimal Matplotlib fallback
-                h, w = frames_overlay[0].shape[:2]
-                dpi = 100
-                fig, ax = plt.subplots(figsize=(w / dpi, h / dpi), dpi=dpi)
-                ax.axis("off")
-                im = ax.imshow(frames_overlay[0], interpolation='nearest')
+                    fr = (255 * np.clip(fr, 0, 1)).astype(np.uint8) if fr.dtype in (np.float32, np.float64) else fr.astype(np.uint8)
 
-                def update(frame):
-                    im.set_data(frame)
-                    return [im]
-
-                fps_out = float(1.0 / max(dt_frame, 1e-6))
-                ani = animation.FuncAnimation(fig, update, frames=frames_overlay, interval=1000 / fps_out, blit=True)
+                # Overlay (in place)
+                frame_rgb = fr.copy()
+                # Build overlay text using on-the-fly access to rollout buffers
                 try:
-                    ani.save(ani_save_path, writer="ffmpeg", fps=fps_out, dpi=dpi,
-                             extra_args=['-vcodec', 'libx264', '-pix_fmt', self.video_pix_fmt, '-preset', self.video_preset, '-crf', str(self.video_crf)])
-                finally:
-                    plt.close(fig)
+                    foot = rollout.foot_infos[i]
+                except Exception:
+                    foot = self.FootInfo(0.0, 0.0, 0.0, 0.0)
+                try:
+                    reward_record = rollout.reward_records[i]
+                except Exception:
+                    reward_record = self.RewardRecord({}, 0.0, 0.0)
+                obs_data = rollout.observation_history[i] if i < len(rollout.observation_history) else None
+                left_lines = self._get_observation_overlay_text(obs_data, foot)
+                right_lines = self._get_reward_overlay_text(reward_record, reward_scales)
 
-        # Return control dt (not video frame dt) so plots align with sim steps
-        return base_name, ani_save_path, float(self.env._config.ctrl_dt)
+                font_scale = 0.8
+                thickness = 2
+                for li, line in enumerate(left_lines):
+                    self._put_text(frame_rgb, line, (10, 30 + li * 30), color=(255, 255, 255), font_scale=font_scale, thickness=thickness)
+                fw = frame_rgb.shape[1]
+                right_x = fw - 390
+                for ri, line in enumerate(right_lines):
+                    if (ri < 3) or (':' not in line):
+                        color = (255, 255, 255)
+                    else:
+                        try:
+                            value = float(line.split(': ')[-1])
+                            color = (0, 255, 0) if value > 0 else (255, 0, 0)
+                        except Exception:
+                            color = (255, 255, 255)
+                    self._put_text(frame_rgb, line, (right_x, 30 + ri * 30), color=color, font_scale=font_scale, thickness=thickness)
+                # Simulation time (bottom-left)
+                time_text = f"t = {fi * dt_frame:.2f} s"
+                fh = frame_rgb.shape[0]
+                self._put_text(frame_rgb, time_text, (10, fh - 10), color=(255, 255, 255), font_scale=font_scale, thickness=thickness)
+
+                # Optional scale
+                if (nh, nw) != frame_rgb.shape[:2]:
+                    frame_rgb = cv2.resize(frame_rgb, (nw, nh), interpolation=cv2.INTER_AREA)
+
+                # Convert to BGR for OpenCV and write
+                frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+                writer.write(frame_bgr)
+        except Exception as e:
+            logging.exception(f"Failed during streaming video encoding: {e}")
+            try:
+                writer.release()
+            except Exception:
+                pass
+            return base_name, None, self.env._config.ctrl_dt
+        finally:
+            try:
+                writer.release()
+            except Exception:
+                pass
+
+        logging.info(f"Saved rollout video to {ani_save_path}")
+        return base_name, ani_save_path, self.env._config.ctrl_dt
 
     def _put_text(self, img: np.ndarray, text: str, org: tuple[int, int], color: tuple[int, int, int], font_scale: float = 0.8, thickness: int = 2):
         """Draw readable text: solid dark background + outline to reduce blur.

@@ -47,9 +47,9 @@ ppo_training_params = {
     'restore_value_fn': True,
 }
 
-train_id = "parameterized_pd"  # Try to use PD control
-iteration = 3
-test_mode = False  # If True, run a short training for testing purposes
+train_id = "add_pushes"
+iteration = 1
+test_mode = True
 env = CassieEnv()
 
 # JIT-wrapped env functions kept as local variables and passed into the visualization callback
@@ -65,7 +65,7 @@ network_factory = functools.partial(
 )
 
 if test_mode:
-    logging.info("\n----------\nRunning in test mode.\n----------")
+    logging.info("\n----------\nRunning in testing mode.\n----------")
     # --- Shorten training for testing ---
     ppo_training_params["num_evals"] = 2
     ppo_training_params["episode_length"] = 5
@@ -79,7 +79,7 @@ logging.info("PPO training parameters:")
 logging.info(ppo_training_params)
 
 save_ckpt_dir = script_dir / "checkpoints" / f"{train_id}" / f"iter_{iteration:02d}"
-restore_ckpt_path = script_dir / "checkpoints/parameterized_pd_2/000032768000"
+restore_ckpt_path = script_dir / "checkpoints/parameterized_pd/iter_03/000013107200"
 
 # Instantiate callback objects
 progress_cb = ProgressCallback(ppo_training_params, script_dir, train_id, iteration, save_plot=True)

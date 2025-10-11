@@ -1,6 +1,5 @@
 from typing import Any, Dict, Optional, Union
 from pathlib import Path
-import math
 
 import jax
 import jax.numpy as jnp
@@ -132,11 +131,11 @@ def default_config() -> config_dict.ConfigDict:
         # --- Random push perturbations during training ---
         # Time-invariant configuration (seconds, hertz) so behavior doesn't depend on ctrl_dt
         pushes=config_dict.create(
-            enabled=False,               # Enable/disable pushes globally
-            start_rate_hz=2.0,           # Push start attempt rate (events per second)
+            enabled=True,               # Enable/disable pushes globally
+            start_rate_hz=1.0,           # Push start attempt rate (events per second)
             min_interval_s=0.50,         # Minimum time between pushes (s)
-            duration_s=0.04,             # Duration of each push (s)
-            force_range=jnp.array([120.0, 320.0]),  # Magnitude (N) of horizontal push
+            duration_s=0.05,             # Duration of each push (s)
+            force_range=jnp.array([50.0, 150.0]),  # Magnitude (N) of horizontal push
             torque_range=jnp.array([0.0, 0.0]),     # Optional body torque magnitude (N·m); default 0 (off)
             target_body="cassie-pelvis",           # Body name to apply the push on (world frame)
             direction_mode="horizontal",           # [horizontal|any3d] (horizontal by default)
@@ -189,7 +188,7 @@ class CassieEnv(mjx_env.MjxEnv):
         # Precomputed constants for rewards/costs (avoid repeated pow/div)
         # -------------------
         # Reference pelvis height
-        # self._pelvis_height_ref = 0.985
+        self._pelvis_height_ref = 0.985
 
         # Inverse-squared scales (1 / scale^2) for various costs
         self._inv_height_err_scale_sq = jnp.array(1.0 / (0.02 ** 2))
@@ -390,10 +389,10 @@ class CassieEnv(mjx_env.MjxEnv):
                         )
 
         # Scale each component by its configured weight
-        per_step_scaled = {k: per_step_raw[k] * self._config.reward_config.weights[k] for k in per_step_raw}
+        per_step_weighted = {k: per_step_raw[k] * self._config.reward_config.weights[k] for k in per_step_raw}
 
         # Per-step components are integrated over dt
-        reward = jnp.sum(jnp.array(list(per_step_scaled.values()))) * self.dt
+        reward = jnp.sum(jnp.array(list(per_step_weighted.values()))) * self.dt
 
         new_step = state.info.get("step", 0) + 1
         
@@ -404,7 +403,7 @@ class CassieEnv(mjx_env.MjxEnv):
             **state.info,
             "step": new_step,
             "rng": rng,
-            "reward_components": RewardComponents(**per_step_scaled),
+            "reward_components": RewardComponents(**per_step_weighted),
             "pos_targets": pos_targets,
             "last_p_gains": p_gains,
             "last_d_gains": d_gains,
@@ -656,20 +655,24 @@ class CassieEnv(mjx_env.MjxEnv):
     # Random push helpers (modular)
     # ------------------------------------------------------------------
 
-    def _push_steps_from_seconds(self, seconds: float) -> int:
-        """Convert seconds to an integer number of control steps, at least 1 when seconds>0."""
-        if seconds <= 0:
-            return 0
-        steps = int(jnp.round(seconds / self.dt).item())
-        return max(steps, 1)
+    def _push_steps_from_seconds(self, seconds: float) -> jax.Array:
+        """Convert seconds to an integer number of control steps as a JAX int32 scalar.
 
-    def _push_start_prob_per_step(self, start_rate_hz: float) -> float:
+        Ensures 0 when seconds <= 0, otherwise at least 1.
+        """
+        sec = jnp.array(seconds, dtype=jnp.float32)
+        steps_f = jnp.round(sec / self.dt)
+        steps_i = jnp.maximum(steps_f.astype(jnp.int32), jnp.array(1, dtype=jnp.int32))
+        steps_i = jnp.where(sec <= 0.0, jnp.array(0, dtype=jnp.int32), steps_i)
+        return steps_i
+
+    def _push_start_prob_per_step(self, start_rate_hz: float) -> jax.Array:
         """Poisson-process start probability per control step for a given rate in Hz.
 
         p = 1 - exp(-lambda * dt), invariant to discretization.
         """
-        lam_dt = jnp.maximum(start_rate_hz * self.dt, 0.0)
-        return (1.0 - jnp.exp(-lam_dt)).item()
+        lam_dt = jnp.maximum(jnp.array(start_rate_hz, dtype=jnp.float32) * self.dt, 0.0)
+        return (1.0 - jnp.exp(-lam_dt))
 
     def _sample_push_force6(self, rng: jax.Array, push_cfg) -> tuple[jax.Array, jax.Array]:
         """Sample a 6D wrench [fx, fy, fz, tx, ty, tz] in world frame given push config."""
@@ -706,9 +709,9 @@ class CassieEnv(mjx_env.MjxEnv):
             return rng, PushState.zeros(), zero
 
         # Convert invariant config into per-step quantities
-        start_p = self._push_start_prob_per_step(float(push_cfg.start_rate_hz))
-        min_interval_steps = self._push_steps_from_seconds(float(push_cfg.min_interval_s))
-        duration_steps = self._push_steps_from_seconds(float(push_cfg.duration_s))
+        start_p = self._push_start_prob_per_step(push_cfg.start_rate_hz)
+        min_interval_steps = self._push_steps_from_seconds(push_cfg.min_interval_s)
+        duration_steps = self._push_steps_from_seconds(push_cfg.duration_s)
 
         steps_rem = push_state.steps_remaining
         cooldown = push_state.cooldown
@@ -729,7 +732,7 @@ class CassieEnv(mjx_env.MjxEnv):
         )
 
         # Update timers
-        new_steps = lax.select(start_now, jnp.array(duration_steps, dtype=jnp.int32), steps_rem)
+        new_steps = lax.select(start_now, duration_steps.astype(jnp.int32), steps_rem)
         active = new_steps > 0
         steps_after = jnp.where(active, new_steps - 1, new_steps)
 
@@ -737,7 +740,7 @@ class CassieEnv(mjx_env.MjxEnv):
         cooldown_dec = jnp.maximum(cooldown - 1, 0)
         new_cooldown = lax.select(
             start_now,
-            jnp.array(min_interval_steps, dtype=jnp.int32),
+            min_interval_steps.astype(jnp.int32),
             jnp.where(idle, cooldown_dec, cooldown),
         )
 
@@ -749,7 +752,7 @@ class CassieEnv(mjx_env.MjxEnv):
         """Apply a 6D wrench to the configured body for the given number of substeps and step the sim."""
         # Build xfrc_applied array
         xfrc = jnp.zeros((self._mjx_model.nbody, 6), dtype=data.xfrc_applied.dtype)
-        xfrc = xfrc.at[self._pelvis_id].set(force6)
+        xfrc = xfrc.at[self._push_target_body_id].set(force6)
 
         def step_once(_: int, d: mjx.Data):
             return mjx_env.step(self._mjx_model, d.replace(xfrc_applied=xfrc), tau, 1)
