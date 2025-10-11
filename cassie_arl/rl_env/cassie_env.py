@@ -12,7 +12,7 @@ from mujoco_playground._src import mjx_env
 
 from cassie_arl.config.cassie_consts import *
 import cassie_arl.rl_env.math_utils as math_utils
-from cassie_arl.rl_env.butterworth import BiquadFilter, design_butterworth_biquad
+# from cassie_arl.rl_env.butterworth import BiquadFilter, design_butterworth_biquad
 
 
 script_dir = Path(__file__).parent
@@ -27,24 +27,28 @@ class RewardComponents:
     (vs an arbitrary dict). All leaves are jax.Arrays with scalar shape ().
     """
     alive: jax.Array
+    pelvis_height: jax.Array
     pelvis_lin_vel: jax.Array
     pelvis_ang_vel: jax.Array
     pelvis_tilt: jax.Array
     motor_ref_error: jax.Array
     action_rate: jax.Array
     torques: jax.Array
+    gain_rate: jax.Array
 
     @classmethod
     def zeros(cls) -> "RewardComponents":
         z = jnp.zeros(())
         return cls(
             alive=z,
+            pelvis_height=z,
             pelvis_lin_vel=z,
             pelvis_ang_vel=z,
             pelvis_tilt=z,
             motor_ref_error=z,
             action_rate=z,
             torques=z,
+            gain_rate=z,
         )
 
 
@@ -53,7 +57,7 @@ def default_config() -> config_dict.ConfigDict:
         # --------------------------------
         # Required simulation parameters
         # --------------------------------
-        ctrl_dt=0.01,
+        ctrl_dt=0.01,  # 100 Hz
         sim_dt=0.002,  # Match "timestep" in MJCF
         episode_length=1000,  # 10 seconds at ctrl_dt=0.01
         # Number of previous steps to include in the observation history.
@@ -104,12 +108,14 @@ def default_config() -> config_dict.ConfigDict:
         reward_config=config_dict.create(
             scales=config_dict.create(
                 alive=2.0,
+                pelvis_height=-0.3,
                 pelvis_lin_vel=-0.3,
                 pelvis_ang_vel=-0.4,
-                pelvis_tilt=-0.4,
-                motor_ref_error=-1.0,
+                pelvis_tilt=-0.3,
+                motor_ref_error=-0.8,
                 action_rate=-0.4,
-                torques=-0.4,
+                torques=-0.05,
+                gain_rate=-0.1,
             ),
         ),
 
@@ -156,12 +162,38 @@ class CassieEnv(mjx_env.MjxEnv):
         self._torque_lowers = jnp.array(self._mj_model.actuator_ctrlrange[:, 0])
         self._torque_uppers = jnp.array(self._mj_model.actuator_ctrlrange[:, 1])
 
-        def geoms_of_body(model, body_id):
-            start = model.body_geomadr[body_id]
-            count = model.body_geomnum[body_id]
-            geom_ids = jnp.arange(start, start + count)
-            return geom_ids
-        
+        # -------------------
+        # Precomputed constants for rewards/costs (avoid repeated pow/div)
+        # -------------------
+        # Reference pelvis height
+        self._pelvis_height_ref = self._init_qpos[QPosIdx.BASE_HEIGHT]
+
+        # Inverse-squared scales (1 / scale^2) for various costs
+        self._inv_height_err_scale_sq = jnp.array(1.0 / (0.02 ** 2))
+        self._inv_pelvis_lin_vel_scale = jnp.array(1.0 / (0.2 ** 2))
+        self._inv_pelvis_ang_vel_scale = jnp.array(1.0 / (0.15 ** 2))
+        self._inv_tilt_err_scale_sq = jnp.array(1.0 / (0.17 ** 2))
+        self._inv_motor_ref_err_scale_sq = jnp.array(1.0 / (0.08 ** 2))
+
+        # Action rate scale depends on control dt
+        self._inv_action_rate_scale_sq = jnp.array(1.0 / ((3.14 * self.dt) ** 2))
+
+        # Torque scale is per-actuator; use upper bounds (assumed symmetric)
+        # cost ~ mean((tau / (ub/2))^2) == mean((tau^2) * (2/ub)^2)
+        self._inv_torque_scales_sq = (2.0 / self._torque_uppers) ** 2
+
+        # Gain-rate scales (guarded against 0)
+        self._p_gain_rate_scale = jnp.maximum(self._config.max_p_gain / 25.0, 1e-6)
+        self._d_gain_rate_scale = jnp.maximum(self._config.max_d_gain / 25.0, 1e-6)
+        self._inv_p_gain_rate_scale_sq = jnp.array(1.0 / (self._p_gain_rate_scale ** 2))
+        self._inv_d_gain_rate_scale_sq = jnp.array(1.0 / (self._d_gain_rate_scale ** 2))
+
+        # def geoms_of_body(model, body_id):
+        #     start = model.body_geomadr[body_id]
+        #     count = model.body_geomnum[body_id]
+        #     geom_ids = jnp.arange(start, start + count)
+        #     return geom_ids
+
         # MJCF geom and body IDs
         # self._floor_gid = self._mj_model.geom("floor").id
         # self._pelvis_id = self._mj_model.body("cassie-pelvis").id
@@ -240,6 +272,9 @@ class CassieEnv(mjx_env.MjxEnv):
             "step": 0,
             "reward_components": RewardComponents.zeros(),
             "pos_targets": jnp.zeros((self._mjx_model.nu,)),
+            # Store last per-joint PD gains to compute gain-rate cost
+            "last_p_gains": jnp.zeros((self._mjx_model.nu,)),
+            "last_d_gains": jnp.zeros((self._mjx_model.nu,)),
             # Rolling observation history buffer of shape (history_len+1, obs_dim)
             "obs_history": obs_history,
         }
@@ -323,7 +358,9 @@ class CassieEnv(mjx_env.MjxEnv):
                             data,
                             state.info,
                             pos_targets,
-                            torques
+                            torques,
+                            p_gains,
+                            d_gains,
                         )
 
         # Scale each component by its configured weight
@@ -343,6 +380,8 @@ class CassieEnv(mjx_env.MjxEnv):
             "rng": rng,
             "reward_components": RewardComponents(**per_step_scaled),
             "pos_targets": pos_targets,
+            "last_p_gains": p_gains,
+            "last_d_gains": d_gains,
             "obs_history": new_hist,
         }
         return state.replace(
@@ -409,6 +448,8 @@ class CassieEnv(mjx_env.MjxEnv):
             info: Dict[str, Any],
             pos_targets: jax.Array,
             torques: jax.Array,
+            p_gains: jax.Array,
+            d_gains: jax.Array,
         ) -> Dict[str, jax.Array]:
         """
         Computes reward components.
@@ -417,14 +458,28 @@ class CassieEnv(mjx_env.MjxEnv):
         determine their relative importance and sign.
         """
 
+        gain_rate_cost = lax.cond(
+            jnp.array(info.get("step", 0)) == 0,
+            lambda _: jnp.array(0.0),
+            lambda _: self._cost_gain_rate(
+                p_gains,
+                d_gains,
+                info.get("last_p_gains", jnp.zeros_like(p_gains)),
+                info.get("last_d_gains", jnp.zeros_like(d_gains)),
+            ),
+            operand=None,
+        )
+
         per_step_rewards = {
             "alive": self._reward_alive(),
+            "pelvis_height": self._cost_pelvis_height(data),
             "pelvis_lin_vel": self._cost_pelvis_lin_vel(data),
             "pelvis_ang_vel": self._cost_pelvis_ang_vel(data),
             "pelvis_tilt": self._cost_pelvis_tilt(data),
             "motor_ref_error": self._cost_motor_reference_error(data),
             "action_rate": self._cost_action_rate(pos_targets, info["pos_targets"]),
             "torques": self._cost_torques(torques),
+            "gain_rate": gain_rate_cost,
         }
 
         return per_step_rewards
@@ -433,19 +488,25 @@ class CassieEnv(mjx_env.MjxEnv):
         """Reward for staying 'alive' (not falling over)."""
         return jnp.array(1.0)
     
+    def _cost_pelvis_height(self, data: mjx.Data) -> jax.Array:
+        """Cost for pelvis height deviation from standing height."""
+        pelvis_height = data.qpos[QPosIdx.BASE_HEIGHT]  # Shape (1,)
+        height_err = pelvis_height - 0.985  # Hardcoded, determined from animation
+        # (err / s)^2 == err^2 * (1/s^2)
+        cost = (height_err[0] ** 2) * self._inv_height_err_scale_sq
+        return jnp.clip(cost, 0.0, 1.0)
+    
     def _cost_pelvis_lin_vel(self, data: mjx.Data) -> jax.Array:
         """Cost for pelvis linear velocity."""
         pelvis_lin_vel = data.qvel[QVelIdx.BASE_LIN_VEL]
         v_sq = jnp.mean(pelvis_lin_vel**2)
-        v_scale = 0.7**2  # Normalizing constant (m/s)^2
-        cost = v_sq / v_scale
+        cost = v_sq * self._inv_pelvis_lin_vel_scale
         return jnp.clip(cost, 0.0, 1.0)
     
     def _cost_pelvis_ang_vel(self, data: mjx.Data) -> jax.Array:
         ang_vel = data.qvel[QVelIdx.BASE_ANG_VEL]
         ang_vel_sq_mean = jnp.mean(ang_vel**2)
-        err_scale = 0.8**2  # Normalizing constant (rad/s)^2
-        cost = ang_vel_sq_mean / err_scale
+        cost = ang_vel_sq_mean * self._inv_pelvis_ang_vel_scale
         return jnp.clip(cost, 0.0, 1.0)
 
     def _cost_pelvis_tilt(self, data: mjx.Data) -> jax.Array:
@@ -458,8 +519,8 @@ class CassieEnv(mjx_env.MjxEnv):
         orientation_err = math_utils.angle_diff(rpy[:2], self._standing_base_rpy[:2])
 
         # Mean squared error, normalized
-        err_scale = 0.35  # radians (~20 degrees)
-        orientation_cost = jnp.mean((orientation_err / err_scale) ** 2)
+        # (err / s)^2 == err^2 * (1/s^2)
+        orientation_cost = jnp.mean((orientation_err ** 2)) * self._inv_tilt_err_scale_sq
 
         # Clip to [0,1]
         return jnp.clip(orientation_cost, 0.0, 1.0)
@@ -468,8 +529,7 @@ class CassieEnv(mjx_env.MjxEnv):
         """Cost for deviation of the motor angles from reference standing pose."""
         motor_qpos = data.qpos[QPosIdx.MOTORS]
         err = motor_qpos - self._standing_jnt_angles
-        err_scale = 0.2  # Normalizing constant (radians)
-        cost = jnp.mean((err / err_scale)**2)
+        cost = jnp.mean((err ** 2)) * self._inv_motor_ref_err_scale_sq
         return jnp.clip(cost, 0.0, 1.0)
 
     def _cost_action_rate(self, pos_targets: jax.Array, last_pos_targets: jax.Array) -> jax.Array:
@@ -479,15 +539,34 @@ class CassieEnv(mjx_env.MjxEnv):
         """
         # If action moves through the full range in quarter of a second, incur max cost.
         act_rate = pos_targets - last_pos_targets
-        rate_scale = 3.14 * self.dt  # Normalizing constant (radians per step)
-        cost = jnp.mean((act_rate / rate_scale)**2)
+        cost = jnp.mean((act_rate ** 2)) * self._inv_action_rate_scale_sq
         return jnp.clip(cost, 0.0, 1.0)
     
     def _cost_torques(self, torques: jax.Array) -> jax.Array:
         """Cost for large torques."""
         # Incur max cost if using half of max torque
-        torque_scales = self._torque_uppers / 2.0  # Normalizing constant
-        cost = jnp.mean((torques / torque_scales)**2)
+        cost = jnp.mean((torques ** 2) * self._inv_torque_scales_sq)
+        return jnp.clip(cost, 0.0, 1.0)
+
+    def _cost_gain_rate(
+            self,
+            p_gains: jax.Array,
+            d_gains: jax.Array,
+            last_p_gains: jax.Array,
+            last_d_gains: jax.Array,
+        ) -> jax.Array:
+        """Cost for rapid per-step changes in learned PD gains.
+
+        Normalization: a change of ~max_gain over about 0.25s (i.e., 25 steps at dt=0.01)
+        should yield near-max cost. Therefore, per-step scale ~= max_gain / 25.
+        """
+        dp = p_gains - last_p_gains
+        dd = d_gains - last_d_gains
+
+        # Mean squared normalized changes for both P and D
+        cost_p = jnp.mean((dp ** 2)) * self._inv_p_gain_rate_scale_sq
+        cost_d = jnp.mean((dd ** 2)) * self._inv_d_gain_rate_scale_sq
+        cost = 0.5 * (cost_p + cost_d)
         return jnp.clip(cost, 0.0, 1.0)
 
     def _get_termination(self, data: mjx.Data, step: jax.Array) -> jax.Array:

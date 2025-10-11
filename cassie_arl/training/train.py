@@ -28,7 +28,7 @@ network_factory_params = {
 
 ppo_training_params = {
     'action_repeat': 1,
-    'batch_size': 4096,
+    'batch_size': 2048,
     'clipping_epsilon': 0.2,
     'discounting': 0.97,  # TODO: Used to be 0.97. Change back?
     'entropy_cost': 0.005,  # Increased initially to encourage exploration. TODO: anneal down to 0?
@@ -36,7 +36,7 @@ ppo_training_params = {
     'learning_rate': 3e-4,  # Was 3e-4
     'max_grad_norm': 1.0,
     'normalize_observations': True,
-    'num_envs': 8192,
+    'num_envs': 4096,
     'num_evals': 25,
     'num_minibatches': 32,
     'num_resets_per_eval': 1,
@@ -47,7 +47,7 @@ ppo_training_params = {
     'restore_value_fn': True,
 }
 
-train_id = "parameterized_pd"  # Try to use PD control
+train_id = "parameterized_pd_2"  # Try to use PD control
 env = CassieEnv()
 
 # JIT-wrapped env functions kept as local variables and passed into the visualization callback
@@ -62,20 +62,20 @@ network_factory = functools.partial(
     **dict(network_factory_params)
 )
 
-# --- Shorten training for testing ---
-ppo_training_params["num_evals"] = 4
-ppo_training_params["episode_length"] = 5
-ppo_training_params["num_envs"] = 1
-ppo_training_params["num_minibatches"] = 4
-ppo_training_params["batch_size"] = 2
-ppo_training_params["unroll_length"] = 8
-ppo_training_params["num_timesteps"] = 100
+# # --- Shorten training for testing ---
+# ppo_training_params["num_evals"] = 4
+# ppo_training_params["episode_length"] = 5
+# ppo_training_params["num_envs"] = 1
+# ppo_training_params["num_minibatches"] = 4
+# ppo_training_params["batch_size"] = 2
+# ppo_training_params["unroll_length"] = 8
+# ppo_training_params["num_timesteps"] = 88
 
 logging.info("PPO training parameters:")
 logging.info(ppo_training_params)
 
 save_ckpt_dir = script_dir / "checkpoints" / f"{train_id}"
-# restore_ckpt_path = script_dir / "checkpoints/try_pd_3/000083066880"
+restore_ckpt_path = script_dir / "checkpoints/parameterized_pd/000111411200"
 
 # Instantiate callback objects
 progress_cb = ProgressCallback(ppo_training_params, script_dir, train_id, save_plot=True)
@@ -85,10 +85,10 @@ train_fn = functools.partial(
     ppo.train, **dict(ppo_training_params),
     network_factory=network_factory,
     randomization_fn=randomizer,
-    # progress_fn=progress_cb,
+    progress_fn=progress_cb,
     policy_params_fn=viz_cb,
-    # save_checkpoint_path=save_ckpt_dir.as_posix(),
-    # restore_checkpoint_path=restore_ckpt_path.as_posix()
+    save_checkpoint_path=save_ckpt_dir.as_posix(),
+    restore_checkpoint_path=restore_ckpt_path.as_posix()
 )
 
 if "save_checkpoint_path" in train_fn.keywords:

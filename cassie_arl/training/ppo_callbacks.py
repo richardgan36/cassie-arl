@@ -200,7 +200,7 @@ class VisualizePolicyCallback:
         for _ in range(self.env._config.episode_length):
             act_rng, rng = jax.random.split(rng)
             action, _ = inference_fn(state.obs, act_rng)
-            # Let the environment perform its own PD + filtering; pass raw action
+            # Let the environment perform its own PD; pass raw action
             state = self.jit_step(state, action)
 
             if bool(state.done):
@@ -296,27 +296,24 @@ class VisualizePolicyCallback:
             left_lines = self._get_observation_overlay_text(obs_data, foot)
             right_lines = self._get_reward_overlay_text(reward_record, reward_scales)
 
-            # Draw text with improved readability
+            # Draw text with improved readability: solid background + outline, no antialias
             font_scale = 0.8
             thickness = 2
-            font = cv2.FONT_HERSHEY_SIMPLEX
             for li, line in enumerate(left_lines):
-                cv2.putText(frame_rgb, line, (10, 30 + li * 30), font, font_scale, (255, 255, 255), thickness)
+                self._put_text(frame_rgb, line, (10, 30 + li * 30), color=(255, 255, 255), font_scale=font_scale, thickness=thickness)
             fw = frame_rgb.shape[1]
-            right_x = fw - 450
+            right_x = fw - 480
             for ri, line in enumerate(right_lines):
-                color = (255, 255, 255)
-                if ri >= 3:  # component rows (after header)
-                    cname = line.split(':')[0]
-                    if cname in reward_record.components:
-                        weighted_val = reward_record.components[cname]
-                        scale = reward_scales.get(cname, 1.0)
-                        raw_val = weighted_val / scale if scale != 0 else 0.0
-                        if raw_val > 0:
-                            color = (0, 255, 0)
-                        elif raw_val < 0:
-                            color = (255, 100, 100)
-                cv2.putText(frame_rgb, line, (right_x, 30 + ri * 30), font, font_scale, color, thickness)
+                # Use white for labels, green for positive rewards, red for negative rewards
+                if (ri < 3) or (':' not in line):
+                    color = (255, 255, 255)  # Labels and headers in white
+                else:
+                    try:
+                        value = float(line.split(': ')[-1])
+                        color = (0, 255, 0) if value > 0 else (255, 0, 0)
+                    except Exception:
+                        color = (255, 255, 255)
+                self._put_text(frame_rgb, line, (right_x, 30 + ri * 30), color=color, font_scale=font_scale, thickness=thickness)
             out_frames.append(frame_rgb)
         return out_frames
 
@@ -369,6 +366,14 @@ class VisualizePolicyCallback:
             lines.append("--- Foot Heights ---")
             lines.append(f"L foot z: {foot.left_foot_z:.3f} m")
             lines.append(f"R foot z: {foot.right_foot_z:.3f} m")
+            # Foot contacts from observation (indices 31:33)
+            try:
+                fc = obs_data[31:33]
+                l_contact = bool(fc[0] >= 0.5)
+                r_contact = bool(fc[1] >= 0.5)
+                lines.append(f"Contacts: L={l_contact}  R={r_contact}")
+            except Exception:
+                pass
         except Exception:
             # Fallback minimal info if parsing fails
             lines = ["Observations: parse error"]
@@ -379,7 +384,7 @@ class VisualizePolicyCallback:
         lines = [
             f"Step Reward: {reward_record.step_reward:.4f}",
             f"Cumulative: {reward_record.cumulative_reward:.4f}",
-            "--- Raw Rewards (actual sign, unweighted) ---",
+            "--- Raw Rewards (signed, unweighted) ---",
         ]
         for name, weighted_value in reward_record.components.items():
             scale = reward_scales.get(name, 1.0)
@@ -393,9 +398,12 @@ class VisualizePolicyCallback:
         fps = float(1.0 / dt_frame)
         ani_save_dir = self.script_dir / "simulation" / f"{self.train_id}"
         ani_save_dir.mkdir(parents=True, exist_ok=True)
-        fig, ax = plt.subplots()
+        # Create a pixel-perfect figure to avoid interpolation blur
+        h, w = frames_overlay[0].shape[:2]
+        dpi = 100
+        fig, ax = plt.subplots(figsize=(w / dpi, h / dpi), dpi=dpi)
         ax.axis("off")
-        im = ax.imshow(frames_overlay[0])
+        im = ax.imshow(frames_overlay[0], interpolation='nearest')
 
         def update(frame):
             im.set_data(frame)
@@ -405,9 +413,37 @@ class VisualizePolicyCallback:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         base_name = f"rollout_step{current_step}-{timestamp}"
         ani_save_path = ani_save_dir / f"{base_name}.mp4"
-        ani.save(ani_save_path, writer="ffmpeg", fps=fps)
+        # Prefer full-chroma to reduce red text blur; fall back if unsupported
+        try:
+            ani.save(ani_save_path, writer="ffmpeg", fps=fps, dpi=dpi,
+                     extra_args=['-vcodec', 'libx264', '-pix_fmt', 'yuv444p', '-crf', '18'])
+        except Exception as e:
+            logging.warning(f"FFmpeg yuv444p failed ({e}); falling back to yuv420p.")
+            ani.save(ani_save_path, writer="ffmpeg", fps=fps, dpi=dpi,
+                     extra_args=['-vcodec', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '18'])
         plt.close(fig)
         return base_name, ani_save_dir, ani_save_path, dt_frame
+
+    def _put_text(self, img: np.ndarray, text: str, org: tuple[int, int], color: tuple[int, int, int], font_scale: float = 0.8, thickness: int = 2):
+        """Draw readable text: solid dark background + outline to reduce blur.
+
+        Note: img is RGB; OpenCV writes BGR values directly into the array channels,
+        but since we display with Matplotlib (RGB), providing standard tuples works
+        as expected for white/green/red.
+        """
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        (tw, th), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+        x, y = org
+        # Background rectangle (solid) to maximize contrast
+        x0 = max(x - 4, 0)
+        y0 = max(y - th - 6, 0)
+        x1 = min(x + tw + 4, img.shape[1] - 1)
+        y1 = min(y + baseline + 4, img.shape[0] - 1)
+        cv2.rectangle(img, (x0, y0), (x1, y1), (0, 0, 0), thickness=-1)
+        # Outline (black, thicker)
+        cv2.putText(img, text, org, font, font_scale, (0, 0, 0), thickness + 2, lineType=cv2.LINE_8)
+        # Foreground text
+        cv2.putText(img, text, org, font, font_scale, color, thickness, lineType=cv2.LINE_8)
 
     def _plot_torques(self, torque_history: List[np.ndarray], base_name: str, save_dir: Path, dt_frame: float):
         if len(torque_history) == 0:
@@ -584,11 +620,7 @@ class VisualizePolicyCallback:
         save_dir: Path,
         dt_frame: float,
     ):
-        """Plot actual joint angles and PD targets used for control.
-
-        Targets correspond to the per-step position targets the PD controller uses;
-        actual joint angles are sampled AFTER the physics integration.
-        """
+        """Plot actual joint angles, PD targets, joint limits, and standing (neutral) pose."""
         if len(motor_qpos_history) == 0:
             logging.warning("No joint angle data collected; episode ended before first step?")
             return
@@ -597,38 +629,76 @@ class VisualizePolicyCallback:
             targ_arr = np.stack(target_history, axis=0) if len(target_history) == len(motor_qpos_history) else None
             T = actual_arr.shape[0]
             time_axis = np.arange(T) * dt_frame
+
             rows, cols = 5, 2
             fig_j, axes_j = plt.subplots(rows, cols, figsize=(cols * 6, rows * 3), sharex=True)
             axes_fj = axes_j.flatten()
+
             joint_names = [
                 "Left Hip Roll", "Left Hip Yaw", "Left Hip Pitch", "Left Knee", "Left Foot",
                 "Right Hip Roll", "Right Hip Yaw", "Right Hip Pitch", "Right Knee", "Right Foot"
             ]
+
+            # Get joint ranges and neutral standing pose
+            jnt_lowers = np.array(self.env._mj_model.jnt_range[JntRangeIdx.MOTORS, 0])
+            jnt_uppers = np.array(self.env._mj_model.jnt_range[JntRangeIdx.MOTORS, 1])
+            jnt_neutral = np.array(self.env._standing_jnt_angles)
+
+            target_jnt_lowers = np.array(self.env._standing_jnt_angles - self.env._max_jnt_deltas)
+            target_jnt_uppers = np.array(self.env._standing_jnt_angles + self.env._max_jnt_deltas)
+
+            # Left side joints (indices 0..4) -> left column
             for row, j in enumerate(range(0, 5)):
                 ax_left = axes_fj[row * cols]
                 ax_left.plot(time_axis, actual_arr[:, j], color='tab:blue', linewidth=1.4, label='Actual')
                 if targ_arr is not None:
-                    ax_left.plot(time_axis, targ_arr[:, j], color='tab:green', linewidth=1.2, linestyle='--', label='Target')
+                    ax_left.plot(time_axis, targ_arr[:, j], color='tab:green', linewidth=1.2, linestyle='-', label='Target')
+
+                # Add horizontal lines for limits and standing pose
+                ax_left.axhline(jnt_lowers[j], color='tab:red', linestyle='--', linewidth=1, label='Lower limit' if row == 0 else "")
+                ax_left.axhline(jnt_uppers[j], color='tab:red', linestyle='--', linewidth=1, label='Upper limit' if row == 0 else "")
+                ax_left.axhline(jnt_neutral[j], color='tab:gray', linestyle=':', linewidth=1.2, label='Standing pose' if row == 0 else "")
+
+                # Add horizontal lines for target limits
+                ax_left.axhline(target_jnt_lowers[j], color='tab:purple', linestyle='--', linewidth=1, label='Target lower limit' if row == 0 else "")
+                ax_left.axhline(target_jnt_uppers[j], color='tab:purple', linestyle='--', linewidth=1, label='Target upper limit' if row == 0 else "")
+
                 ax_left.set_title(joint_names[j])
                 ax_left.set_ylabel('Angle (rad)')
                 ax_left.grid(alpha=0.3)
-                if row == 0:
-                    ax_left.legend(frameon=False, fontsize=8, ncol=2, loc='upper right')
+
+            # Right side joints (indices 5..9) -> right column
             for row, j in enumerate(range(5, 10)):
                 ax_right = axes_fj[row * cols + 1]
                 ax_right.plot(time_axis, actual_arr[:, j], color='tab:blue', linewidth=1.4, label='Actual')
                 if targ_arr is not None:
-                    ax_right.plot(time_axis, targ_arr[:, j], color='tab:green', linewidth=1.2, linestyle='--', label='Target')
+                    ax_right.plot(time_axis, targ_arr[:, j], color='tab:green', linewidth=1.2, linestyle='-', label='Target')
+
+                # Add horizontal lines for limits and standing pose
+                ax_right.axhline(jnt_lowers[j], color='tab:red', linestyle='--', linewidth=1)
+                ax_right.axhline(jnt_uppers[j], color='tab:red', linestyle='--', linewidth=1)
+                ax_right.axhline(jnt_neutral[j], color='tab:gray', linestyle=':', linewidth=1.2)
+
+                # Add horizontal lines for target limits
+                ax_right.axhline(target_jnt_lowers[j], color='tab:purple', linestyle='--', linewidth=1)
+                ax_right.axhline(target_jnt_uppers[j], color='tab:purple', linestyle='--', linewidth=1)
+
                 ax_right.set_title(joint_names[j])
                 ax_right.grid(alpha=0.3)
+
+            # Common legend on the first subplot
+            axes_fj[0].legend(frameon=False, fontsize=8, ncol=2, loc='upper right')
+
             axes_fj[8].set_xlabel('Time (s)')
             axes_fj[9].set_xlabel('Time (s)')
-            fig_j.suptitle('Joint Angles: Actual vs PD Targets')
+
+            fig_j.suptitle('Joint Angles: Actual vs PD Targets (with Limits & Standing Pose)')
             fig_j.tight_layout(rect=[0, 0, 1, 0.96])
+
             joint_plot_path = save_dir / f"{base_name}_joint_angles.png"
             fig_j.savefig(joint_plot_path, dpi=160)
             plt.close(fig_j)
             logging.info(f"Saved joint angle montage to {joint_plot_path}")
+
         except Exception as e:
             logging.exception(f"Failed generating/saving joint angle montage: {e}")
-
