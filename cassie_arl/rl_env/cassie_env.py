@@ -58,22 +58,6 @@ class RewardComponents:
         )
 
 
-@struct.dataclass
-class PushState:
-    """PyTree for storing random push state between steps."""
-    steps_remaining: jax.Array  # int32
-    cooldown: jax.Array         # int32
-    force6: jax.Array           # (6,)
-
-    @classmethod
-    def zeros(cls) -> "PushState":
-        return cls(
-            steps_remaining=jnp.array(0, dtype=jnp.int32),
-            cooldown=jnp.array(0, dtype=jnp.int32),
-            force6=jnp.zeros((6,), dtype=jnp.float32),
-        )
-
-
 def default_config() -> config_dict.ConfigDict:
     return config_dict.create(
         # --------------------------------
@@ -127,23 +111,6 @@ def default_config() -> config_dict.ConfigDict:
                 gain_rate=-0.0,  # Initially -0.1 to encourate constant gains but removed now that the agent has already learned this behavior 
             ),
         ),
-
-        # --- Random push perturbations during training ---
-        # Time-invariant configuration (seconds, hertz) so behavior doesn't depend on ctrl_dt
-        pushes=config_dict.create(
-            enabled=True,               # Enable/disable pushes globally
-            start_rate_hz=1.0,           # Push start attempt rate (events per second)
-            min_interval_s=0.50,         # Minimum time between pushes (s)
-            duration_s=0.05,             # Duration of each push (s)
-            force_range=jnp.array([50.0, 150.0]),  # Magnitude (N) of horizontal push
-            torque_range=jnp.array([0.0, 0.0]),     # Optional body torque magnitude (N·m); default 0 (off)
-            target_body="cassie-pelvis",           # Body name to apply the push on (world frame)
-            direction_mode="horizontal",           # [horizontal|any3d] (horizontal by default)
-        ),
-
-        # filters=config_dict.create(
-        #     target_cutoff_hz=6.0,  # Hz for target joint angle smoothing
-        # )
     )
 
 
@@ -232,7 +199,7 @@ class CassieEnv(mjx_env.MjxEnv):
         # self._left_foot_gid = geoms_of_body(self._mj_model, self._left_foot_id)
         # self._right_foot_gid = geoms_of_body(self._mj_model, self._right_foot_id)
 
-        self._push_target_body_id = self._mj_model.body(self._config.pushes.target_body).id
+        # self._push_target_body_id = self._mj_model.body(self._config.pushes.target_body).id
     
     # ----------------------------------------------------------------------
     # Required abstract methods/properties
@@ -292,8 +259,6 @@ class CassieEnv(mjx_env.MjxEnv):
             "last_d_gains": jnp.zeros((self._mjx_model.nu,)),
             # Rolling observation history buffer of shape (history_len+1, obs_dim)
             "obs_history": obs_history,
-            # Random push state (control-step granularity)
-            "push_state": PushState.zeros(),
         }
 
         return mjx_env.State(
@@ -346,13 +311,6 @@ class CassieEnv(mjx_env.MjxEnv):
 
         pos_targets = self._action_to_jnt_targets(jnt_deltas_raw)  # The first 10 actions are joint angle deltas in [-1, 1]
 
-        # Decide and update random push state
-        push_state: PushState = state.info.get("push_state", PushState.zeros())
-        push_cfg = self._config.pushes if hasattr(self._config, "pushes") else None
-        push_enabled = (push_cfg is not None) and bool(push_cfg.enabled)
-
-        rng, push_state, force6_to_apply = self._update_push_state(rng, push_state, push_cfg, push_enabled)
-
         # Run PD control at simulator substep frequency (sim_dt):
         # Hold pos_targets and gains constant within this control interval,
         # but recompute torques each substep using the latest q, qdot.
@@ -360,8 +318,7 @@ class CassieEnv(mjx_env.MjxEnv):
             data_carry, _last_tau = carry
             tau = self._pd_control(data_carry, pos_targets, p_gains, d_gains)
             tau = jnp.clip(tau, self._torque_lowers, self._torque_uppers)
-            # Apply external force for this substep if a push is active
-            data_next = self._apply_external_force(data_carry, force6_to_apply, substeps=1, tau=tau)
+            data_next = mjx_env.step(self._mjx_model, data_carry, tau, 1)
             return (data_next, tau)
 
         data, torques = lax.fori_loop(
@@ -408,8 +365,6 @@ class CassieEnv(mjx_env.MjxEnv):
             "last_p_gains": p_gains,
             "last_d_gains": d_gains,
             "obs_history": new_hist,
-            # Push bookkeeping
-            "push_state": push_state,
         }
         return state.replace(
             data=data,
@@ -695,10 +650,10 @@ class CassieEnv(mjx_env.MjxEnv):
     def _update_push_state(
         self,
         rng: jax.Array,
-        push_state: PushState,
+        push_state,
         push_cfg: Optional[config_dict.ConfigDict],
         push_enabled: bool,
-    ) -> tuple[jax.Array, PushState, jax.Array]:
+    ) -> tuple[jax.Array, jax.Array]:
         """Advance push state by one control step and return wrench to apply.
 
         Returns (rng, new_push_state, force6_to_apply)
@@ -706,7 +661,7 @@ class CassieEnv(mjx_env.MjxEnv):
         if not push_enabled:
             # No pushes; decay any ongoing state to idle
             zero = jnp.zeros((6,), dtype=jnp.float32)
-            return rng, PushState.zeros(), zero
+            return rng, zero
 
         # Convert invariant config into per-step quantities
         start_p = self._push_start_prob_per_step(push_cfg.start_rate_hz)
@@ -746,7 +701,7 @@ class CassieEnv(mjx_env.MjxEnv):
 
         force6_to_apply = jnp.where(active, new_force6, jnp.zeros_like(new_force6))
 
-        return rng, PushState(steps_remaining=steps_after.astype(jnp.int32), cooldown=new_cooldown.astype(jnp.int32), force6=new_force6), force6_to_apply
+        return rng, force6_to_apply
 
     def _apply_external_force(self, data: mjx.Data, force6: jax.Array, substeps: int, tau: jax.Array) -> mjx.Data:
         """Apply a 6D wrench to the configured body for the given number of substeps and step the sim."""
