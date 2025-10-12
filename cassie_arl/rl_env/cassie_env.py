@@ -111,6 +111,15 @@ def default_config() -> config_dict.ConfigDict:
                 gain_rate=-0.0,  # Initially -0.1 to encourate constant gains but removed now that the agent has already learned this behavior 
             ),
         ),
+
+        # --- Push configuration ---
+        push_config=config_dict.create(
+            force_range=jnp.array([30.0, 100.0]),  # Random uniform in this range
+            push_duration=0.1,  # Seconds
+
+
+
+        )
     )
 
 
@@ -199,7 +208,8 @@ class CassieEnv(mjx_env.MjxEnv):
         # self._left_foot_gid = geoms_of_body(self._mj_model, self._left_foot_id)
         # self._right_foot_gid = geoms_of_body(self._mj_model, self._right_foot_id)
 
-        # self._push_target_body_id = self._mj_model.body(self._config.pushes.target_body).id
+        # For debugging: use pelvis as push target
+        self._push_target_body_id = self._pelvis_id
     
     # ----------------------------------------------------------------------
     # Required abstract methods/properties
@@ -311,6 +321,11 @@ class CassieEnv(mjx_env.MjxEnv):
 
         pos_targets = self._action_to_jnt_targets(jnt_deltas_raw)  # The first 10 actions are joint angle deltas in [-1, 1]
 
+        # DEBUG: Simple hardcoded push force for testing
+        # Apply a large horizontal push force to the pelvis for debugging
+        # Increase force magnitude to be very noticeable in simulation
+        debug_push_force = jnp.array([5000.0, 0.0, 0.0, 0.0, 0.0, 0.0])  # 5000N forward force, no torque
+        
         # Run PD control at simulator substep frequency (sim_dt):
         # Hold pos_targets and gains constant within this control interval,
         # but recompute torques each substep using the latest q, qdot.
@@ -318,7 +333,10 @@ class CassieEnv(mjx_env.MjxEnv):
             data_carry, _last_tau = carry
             tau = self._pd_control(data_carry, pos_targets, p_gains, d_gains)
             tau = jnp.clip(tau, self._torque_lowers, self._torque_uppers)
-            data_next = mjx_env.step(self._mjx_model, data_carry, tau, 1)
+            
+            # Apply debug push force
+            data_next = self._apply_external_force(data_carry, debug_push_force)
+            data_next = mjx_env.step(self._mjx_model, data_next, tau, 1)
             return (data_next, tau)
 
         data, torques = lax.fori_loop(
@@ -377,8 +395,6 @@ class CassieEnv(mjx_env.MjxEnv):
     def _get_obs(self, data: mjx.Data, last_torques: jax.Array) -> jax.Array:
         """Constructs observation from mjx.Data (Cassie)."""
         # TODO: separate "state" and "privileged state"
-        # TODO: We are now using joint angle deltas. Consider changing the action
-        #       to represent deltas relative to standing pose as well.
         # TODO: consider adding foot forces
         # TODO: consider adding dual history architecture (Z Li). Probably not all
         #       that useful right now because state is relatively Markovian. But may
@@ -439,6 +455,7 @@ class CassieEnv(mjx_env.MjxEnv):
         All rewards/costs are in [0, 1]. Their weights in self._config.reward_config.weights
         determine their relative importance and sign.
         """
+        # TODO: add cost for distance between feet (sometimes the robot has a very narrow stance)
 
         gain_rate_cost = lax.cond(
             jnp.array(info.get("step", 0)) == 0,
@@ -703,16 +720,17 @@ class CassieEnv(mjx_env.MjxEnv):
 
         return rng, force6_to_apply
 
-    def _apply_external_force(self, data: mjx.Data, force6: jax.Array, substeps: int, tau: jax.Array) -> mjx.Data:
-        """Apply a 6D wrench to the configured body for the given number of substeps and step the sim."""
+    def _apply_external_force(self, data: mjx.Data, force6: jax.Array) -> mjx.Data:
+        """Apply a 6D wrench to the configured body."""
         # Build xfrc_applied array
         xfrc = jnp.zeros((self._mjx_model.nbody, 6), dtype=data.xfrc_applied.dtype)
         xfrc = xfrc.at[self._push_target_body_id].set(force6)
 
-        def step_once(_: int, d: mjx.Data):
-            return mjx_env.step(self._mjx_model, d.replace(xfrc_applied=xfrc), tau, 1)
+        # DEBUG: Print the applied force for debugging
+        # jax.debug.print("Applied external force: {force} to body {body_id}", 
+        #                 force=force6, body_id=self._push_target_body_id)
 
-        return lax.fori_loop(0, substeps, step_once, data)
+        return data.replace(xfrc_applied=xfrc)
 
     def _pd_control(
             self,

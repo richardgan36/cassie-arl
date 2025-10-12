@@ -314,52 +314,6 @@ class VisualizePolicyCallback:
         if ani_save_path is not None:
             logging.info(f"Saved rollout video to {ani_save_path}")
 
-    def _render_frames(self, traj: List[Any]):
-        scene_option = mj.MjvOption()
-        scene_option.geomgroup[2] = True
-        scene_option.geomgroup[3] = False
-        scene_option.flags[mj.mjtVisFlag.mjVIS_CONTACTPOINT] = True
-        scene_option.flags[mj.mjtVisFlag.mjVIS_TRANSPARENT] = False
-        scene_option.flags[mj.mjtVisFlag.mjVIS_PERTFORCE] = False
-        return self.env.render(traj, camera="track", scene_option=scene_option, width=640*2, height=480)
-
-    def _apply_overlays(self, frames, rollout: 'VisualizePolicyCallback.RolloutData', dt_frame: float):
-        reward_scales = {k: float(v) for k, v in self.env._config.reward_config.weights.items()}
-        out_frames = []
-        for idx, frame in enumerate(frames):
-            frame_rgb = np.array(frame).copy()
-            foot = rollout.foot_infos[idx]
-            reward_record = rollout.reward_records[idx]
-            # Build left column (observations) and right column (reward components)
-            obs_data = rollout.observation_history[idx] if idx < len(rollout.observation_history) else None
-            left_lines = self._get_observation_overlay_text(obs_data, foot)
-            right_lines = self._get_reward_overlay_text(reward_record, reward_scales)
-
-            # Draw text with improved readability: solid background + outline, no antialias
-            font_scale = 0.8
-            thickness = 2
-            for li, line in enumerate(left_lines):
-                self._put_text(frame_rgb, line, (10, 30 + li * 30), color=(255, 255, 255), font_scale=font_scale, thickness=thickness)
-            fw = frame_rgb.shape[1]
-            right_x = fw - 390
-            for ri, line in enumerate(right_lines):
-                # Use white for labels, green for positive rewards, red for negative rewards
-                if (ri < 3) or (':' not in line):
-                    color = (255, 255, 255)  # Labels and headers in white
-                else:
-                    try:
-                        value = float(line.split(': ')[-1])
-                        color = (0, 255, 0) if value > 0 else (255, 0, 0)
-                    except Exception:
-                        color = (255, 255, 255)
-                self._put_text(frame_rgb, line, (right_x, 30 + ri * 30), color=color, font_scale=font_scale, thickness=thickness)
-            # Simulation time (bottom-left)
-            time_text = f"t = {idx * dt_frame:.2f} s"
-            fh = frame_rgb.shape[0]
-            self._put_text(frame_rgb, time_text, (10, fh - 10), color=(255, 255, 255), font_scale=font_scale, thickness=thickness)
-            out_frames.append(frame_rgb)
-        return out_frames
-
     def _get_observation_overlay_text(self, obs_data, foot):
         """Prepare left-column observation text using latest single-step observation.
 
@@ -460,8 +414,12 @@ class VisualizePolicyCallback:
         scene_option.geomgroup[2] = True
         scene_option.geomgroup[3] = False
         scene_option.flags[mj.mjtVisFlag.mjVIS_CONTACTPOINT] = True
+        scene_option.flags[mj.mjtVisFlag.mjVIS_CONTACTFORCE] = True
+        scene_option.flags[mj.mjtVisFlag.mjVIS_COM] = True
         scene_option.flags[mj.mjtVisFlag.mjVIS_TRANSPARENT] = False
-        scene_option.flags[mj.mjtVisFlag.mjVIS_PERTFORCE] = False
+        scene_option.flags[mj.mjtVisFlag.mjVIS_PERTFORCE] = True
+        scene_option.flags[mj.mjtVisFlag.mjVIS_PERTOBJ] = True  # Try perturbation objects
+        scene_option.flags[mj.mjtVisFlag.mjVIS_INERTIA] = True  # Try to visualize inertia to test
 
         # Helper to render a single frame for a given state index
         def render_one(i: int) -> np.ndarray:
