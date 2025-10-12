@@ -73,7 +73,7 @@ if test_mode:
     ppo_training_params["num_minibatches"] = 4
     ppo_training_params["batch_size"] = 2
     ppo_training_params["unroll_length"] = 8
-    ppo_training_params["num_timesteps"] = 106
+    ppo_training_params["num_timesteps"] = 110
 
 logging.info("PPO training parameters:")
 logging.info(ppo_training_params)
@@ -82,8 +82,24 @@ save_ckpt_dir = script_dir / "checkpoints" / f"{train_id}" / f"iter_{iteration:0
 restore_ckpt_path = script_dir / "checkpoints/parameterized_pd/iter_05/000015728640"
 
 # Instantiate callback objects
-progress_cb = ProgressCallback(ppo_training_params, script_dir, train_id, iteration, save_plot=True)
-viz_cb = VisualizePolicyCallback(env, jit_reset, jit_step, script_dir, train_id, iteration, run_every_n_calls=1, test_mode=test_mode)
+progress_cb = ProgressCallback(
+    ppo_training_params["num_timesteps"],
+    script_dir,
+    train_id,
+    iteration,
+    save_plot=True)
+
+viz_cb = VisualizePolicyCallback(
+    env,
+    jit_reset,
+    jit_step,
+    script_dir,
+    train_id,
+    iteration,
+    run_every_n_calls=1,
+    skip_first_n_calls=0,
+    test_mode=test_mode
+)
 
 train_fn = functools.partial(
     ppo.train, **dict(ppo_training_params),

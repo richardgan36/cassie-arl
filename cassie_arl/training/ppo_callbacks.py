@@ -8,12 +8,10 @@ from pathlib import Path
 import time
 
 import matplotlib.pyplot as plt
-import matplotlib.animation as animation
 import mujoco as mj
 import jax
 import numpy as np
 import cv2
-import imageio.v2 as imageio
 from brax.training import types
 import io
 import contextlib
@@ -32,13 +30,13 @@ class ProgressCallback:
     """Callable progress callback for Brax PPO training loop."""
     def __init__(
             self,
-            training_params: dict,
+            num_timesteps: dict,
             script_dir: Path,
             train_id: str,
             iteration: int,
             save_plot: bool = True
         ):
-        self.training_params = training_params
+        self.num_timesteps = num_timesteps
         self.script_dir = script_dir
         self.iteration = iteration
         self.save_plot = save_plot
@@ -71,7 +69,7 @@ class ProgressCallback:
 
         plt.clf()  # Clear the current figure
         plt.errorbar(self.x_data, self.y_data, yerr=self.y_dataerr, color="blue")
-        plt.xlim([0, self.training_params["num_timesteps"] * 1.25])
+        plt.xlim([0, self.num_timesteps * 1.2])
         plt.xlabel("# environment steps")
         plt.ylabel("reward per episode")
         plt.title(f"y={self.y_data[-1]:.3f}")
@@ -133,27 +131,23 @@ class VisualizePolicyCallback:
             train_id: str,
             iteration: int,
             run_every_n_calls: int = 1,
+            skip_first_n_calls: int = 0,
             test_mode=False,
             video_fps: int = 30,
             video_scale: float = 1.0,
-            video_crf: int = 22,  # lower = better quality, 18-28 reasonable range
-            video_pix_fmt: str = "yuv420p",  # Options: 'yuv420p' (more compatible), 'yuv422p', 'yuv444p' (less compression)
-            video_preset: str = "veryfast"  
     ):
         self.env = env
         self.jit_reset = jit_reset
         self.jit_step = jit_step
         self.script_dir = script_dir
-        self.run_every_n_calls = run_every_n_calls  # frequency control
+        self.run_every_n_calls = run_every_n_calls
+        self.skip_first_n_calls = skip_first_n_calls
         self.test_mode = test_mode  # If True, save animation and plots to a test directory
         self._call_count = 0
 
         # Video settings
         self.video_fps = video_fps
         self.video_scale = video_scale
-        self.video_crf = video_crf
-        self.video_pix_fmt = video_pix_fmt
-        self.video_preset = video_preset
 
         # Centralized directory for all visualization artifacts
         # Keeping the same path as before for backward compatibility
@@ -196,6 +190,9 @@ class VisualizePolicyCallback:
         self._call_count += 1
         if (self._call_count % self.run_every_n_calls) != 0:
             logging.info(f"Skipping visualization call {self._call_count} (every {self.run_every_n_calls})")
+            return False
+        if self._call_count <= self.skip_first_n_calls:
+            logging.info(f"Skipping visualization call {self._call_count} (first {self.skip_first_n_calls})")
             return False
         return True
 
@@ -439,7 +436,13 @@ class VisualizePolicyCallback:
         return lines
 
     # ----------------------------- Saving Artifacts ------------------------------
-    def _save_video_streaming(self, current_step: int, rollout: 'VisualizePolicyCallback.RolloutData', idxs: List[int], dt_frame: float):
+    def _save_video_streaming(
+            self,
+            current_step: int,
+            rollout: 'VisualizePolicyCallback.RolloutData',
+            idxs: List[int],
+            dt_frame: float
+    ) -> tuple[str, Path | None, float]:
         """Render, overlay, and encode video in a streaming fashion to avoid large memory spikes.
 
         Returns base_name, path, and control dt (for plots).
