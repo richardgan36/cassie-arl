@@ -93,6 +93,12 @@ def vec_world_to_body(base_quat: jax.Array, v_world: jax.Array) -> jax.Array:
     return quat_apply(q_conj, v_world)
 
 
+def vec_body_to_world(base_quat: jax.Array, v_body: jax.Array) -> jax.Array:
+    """Rotate body-frame vector into world frame."""
+    # base_quat maps body->world, so world_vec = q * v_body * q_conj
+    return quat_apply(base_quat, v_body)
+
+
 def angle_diff(angle1: jax.Array, angle2: jax.Array) -> jax.Array:
     """
     Compute the wrapped difference between two angles in radians.

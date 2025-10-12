@@ -11,6 +11,7 @@ from ml_collections import config_dict
 from mujoco_playground._src import mjx_env
 
 import cassie_arl.rl_env.math_utils as math_utils
+from cassie_arl.rl_env.push_system import PushSystem, PushState, apply_wrench_to_body
 from cassie_arl.config.cassie_consts import (
     FOOT_OFFSET,
     TARSUS_HIT_GROUND_THRESHOLD,
@@ -76,6 +77,7 @@ def default_config() -> config_dict.ConfigDict:
         history_len=2,
 
         # --- PD control parameters ---
+        # Max Kp and Kd: the gains from the policy are scaled to [0, max]
         max_p_gain=8.0,  # Maximum Kp that can be learned by the agent
         max_d_gain=0.8,  # Maximum Kd that can be learned by the agent
 
@@ -114,18 +116,32 @@ def default_config() -> config_dict.ConfigDict:
 
         # --- Push configuration ---
         push_config=config_dict.create(
-            force_range=jnp.array([30.0, 100.0]),  # Random uniform in this range
-            push_duration=0.1,  # Seconds
+            enabled=True,
+            
+            force_ranges=config_dict.create(
+                x=jnp.array([40.0, 60.0]),   # Forward/backward
+                y=jnp.array([0.0, 0.0]),     # Left/right
+                z=jnp.array([0.0, 0.0]),     # Up/down
+            ),
 
-
-
+            # Torque range [min, max] in N⋅m
+            torque_range=jnp.array([0.0, 20.0]),
+            
+            # Push timing
+            interval_range=jnp.array([1.0, 2.0]),    # Time between pushes (seconds)
+            duration_range=jnp.array([0.05, 0.1]),   # Push duration (seconds)
+            
+            # Training progression
+            push_start_time=1.5,  # Delay before first push (let policy stabilize)
+            
+            # Target body (can be overridden, defaults to pelvis)
+            target_body="cassie-pelvis",
         )
     )
 
 
 class CassieEnv(mjx_env.MjxEnv):
     """Cassie environment built on MJX, compatible with Brax PPO."""
-    # TODO: add random pushes to improve robustness
     # TODO: add metrics
 
     def __init__(
@@ -208,8 +224,10 @@ class CassieEnv(mjx_env.MjxEnv):
         # self._left_foot_gid = geoms_of_body(self._mj_model, self._left_foot_id)
         # self._right_foot_gid = geoms_of_body(self._mj_model, self._right_foot_id)
 
-        # For debugging: use pelvis as push target
-        self._push_target_body_id = self._pelvis_id
+        # Initialize push system
+        push_target_body_name = self._config.push_config.get("target_body", "cassie-pelvis")
+        self._push_target_body_id = self._mj_model.body(push_target_body_name).id
+        self._push_system = PushSystem(self._config.push_config, self._push_target_body_id)
     
     # ----------------------------------------------------------------------
     # Required abstract methods/properties
@@ -249,6 +267,9 @@ class CassieEnv(mjx_env.MjxEnv):
 
         rng, qpos, qvel = self._add_perturbations(rng, qpos, qvel)
 
+        # Split RNG for push system
+        rng, push_rng = jax.random.split(rng)
+
         data = mjx_env.init(self._mjx_model, qpos=qpos, qvel=qvel)
         # Use zeros torques with correct actuator dimension for initial obs
         zero_torques = jnp.zeros((self._mjx_model.nu,))
@@ -258,6 +279,9 @@ class CassieEnv(mjx_env.MjxEnv):
         hist_len = int(self._config.history_len) + 1  # t plus previous steps
         obs_history = jnp.tile(obs_single[None, :], (hist_len, 1))
         obs = obs_history.reshape(-1)
+
+        # Initialize push state
+        push_state = PushState.init(push_rng, self._config.push_config.push_start_time)
 
         info = {
             "rng": rng,
@@ -269,6 +293,8 @@ class CassieEnv(mjx_env.MjxEnv):
             "last_d_gains": jnp.zeros((self._mjx_model.nu,)),
             # Rolling observation history buffer of shape (history_len+1, obs_dim)
             "obs_history": obs_history,
+            # Push state
+            "push_state": push_state,
         }
 
         return mjx_env.State(
@@ -321,10 +347,14 @@ class CassieEnv(mjx_env.MjxEnv):
 
         pos_targets = self._action_to_jnt_targets(jnt_deltas_raw)  # The first 10 actions are joint angle deltas in [-1, 1]
 
-        # DEBUG: Simple hardcoded push force for testing
-        # Apply a large horizontal push force to the pelvis for debugging
-        # Increase force magnitude to be very noticeable in simulation
-        debug_push_force = jnp.array([5000.0, 0.0, 0.0, 0.0, 0.0, 0.0])  # 5000N forward force, no torque
+        # Update push system and get current wrench to apply
+        current_time = state.info.get("step", 0) * self.dt
+        base_quat = state.data.qpos[QPosIdx.BASE_QUAT]
+        push_state, push_wrench = self._push_system.update(
+            state.info["push_state"], 
+            current_time,
+            base_quat
+        )
         
         # Run PD control at simulator substep frequency (sim_dt):
         # Hold pos_targets and gains constant within this control interval,
@@ -334,8 +364,13 @@ class CassieEnv(mjx_env.MjxEnv):
             tau = self._pd_control(data_carry, pos_targets, p_gains, d_gains)
             tau = jnp.clip(tau, self._torque_lowers, self._torque_uppers)
             
-            # Apply debug push force
-            data_next = self._apply_external_force(data_carry, debug_push_force)
+            # Apply push force using the push system
+            data_next = apply_wrench_to_body(
+                data_carry, 
+                self._push_target_body_id, 
+                push_wrench, 
+                self._mjx_model
+            )
             data_next = mjx_env.step(self._mjx_model, data_next, tau, 1)
             return (data_next, tau)
 
@@ -383,6 +418,7 @@ class CassieEnv(mjx_env.MjxEnv):
             "last_p_gains": p_gains,
             "last_d_gains": d_gains,
             "obs_history": new_hist,
+            "push_state": push_state,
         }
         return state.replace(
             data=data,
@@ -578,18 +614,6 @@ class CassieEnv(mjx_env.MjxEnv):
 
         done = jnp.logical_or(fallen, max_steps_reached)
         return done
-
-    def _action_norm2torque(
-            self,
-            action: jax.Array,
-            torque_lb: jax.Array,
-            torque_ub: jax.Array,
-        ) -> jax.Array:
-        """
-        Converts normalized action in [-1, 1] to torques.
-        """
-        # Scale action to torque range
-        return torque_lb + 0.5 * (torque_ub - torque_lb) * (action + 1.0)
     
     def _has_fallen(self, data: mjx.Data) -> jax.Array:
         """Returns True if Cassie has fallen (pelvis height below threshold or tarsus hit ground)."""
@@ -622,115 +646,6 @@ class CassieEnv(mjx_env.MjxEnv):
             may require the target to be outside the joint limits.
         """
         return self._standing_jnt_angles + joint_deltas_normalized * self._max_jnt_deltas
-
-    # ------------------------------------------------------------------
-    # Random push helpers (modular)
-    # ------------------------------------------------------------------
-
-    def _push_steps_from_seconds(self, seconds: float) -> jax.Array:
-        """Convert seconds to an integer number of control steps as a JAX int32 scalar.
-
-        Ensures 0 when seconds <= 0, otherwise at least 1.
-        """
-        sec = jnp.array(seconds, dtype=jnp.float32)
-        steps_f = jnp.round(sec / self.dt)
-        steps_i = jnp.maximum(steps_f.astype(jnp.int32), jnp.array(1, dtype=jnp.int32))
-        steps_i = jnp.where(sec <= 0.0, jnp.array(0, dtype=jnp.int32), steps_i)
-        return steps_i
-
-    def _push_start_prob_per_step(self, start_rate_hz: float) -> jax.Array:
-        """Poisson-process start probability per control step for a given rate in Hz.
-
-        p = 1 - exp(-lambda * dt), invariant to discretization.
-        """
-        lam_dt = jnp.maximum(jnp.array(start_rate_hz, dtype=jnp.float32) * self.dt, 0.0)
-        return (1.0 - jnp.exp(-lam_dt))
-
-    def _sample_push_force6(self, rng: jax.Array, push_cfg) -> tuple[jax.Array, jax.Array]:
-        """Sample a 6D wrench [fx, fy, fz, tx, ty, tz] in world frame given push config."""
-        rng1, rng2, rng3 = jax.random.split(rng, 3)
-        if getattr(push_cfg, "direction_mode", "horizontal") == "horizontal":
-            theta = jax.random.uniform(rng1, (), minval=0.0, maxval=2.0 * jnp.pi)
-            direction = jnp.array([jnp.cos(theta), jnp.sin(theta), 0.0])
-        else:
-            # Any-3D unit vector (sample from normal and normalize)
-            v = jax.random.normal(rng1, (3,))
-            norm = jnp.maximum(jnp.linalg.norm(v), 1e-6)
-            direction = v / norm
-
-        f_mag = jax.random.uniform(rng2, (), minval=push_cfg.force_range[0], maxval=push_cfg.force_range[1])
-        t_mag = jax.random.uniform(rng3, (), minval=push_cfg.torque_range[0], maxval=push_cfg.torque_range[1])
-        force = f_mag * direction
-        torque = jnp.array([0.0, 0.0, t_mag])  # By default apply torque about z
-        return rng3, jnp.concatenate([force, torque])
-
-    def _update_push_state(
-        self,
-        rng: jax.Array,
-        push_state,
-        push_cfg: Optional[config_dict.ConfigDict],
-        push_enabled: bool,
-    ) -> tuple[jax.Array, jax.Array]:
-        """Advance push state by one control step and return wrench to apply.
-
-        Returns (rng, new_push_state, force6_to_apply)
-        """
-        if not push_enabled:
-            # No pushes; decay any ongoing state to idle
-            zero = jnp.zeros((6,), dtype=jnp.float32)
-            return rng, zero
-
-        # Convert invariant config into per-step quantities
-        start_p = self._push_start_prob_per_step(push_cfg.start_rate_hz)
-        min_interval_steps = self._push_steps_from_seconds(push_cfg.min_interval_s)
-        duration_steps = self._push_steps_from_seconds(push_cfg.duration_s)
-
-        steps_rem = push_state.steps_remaining
-        cooldown = push_state.cooldown
-        prev_force6 = push_state.force6
-
-        # Decide if we start a push this step
-        rng, key_start = jax.random.split(rng)
-        start_prob = jax.random.uniform(key_start, ())
-        can_start = jnp.logical_and(steps_rem == 0, cooldown == 0)
-        start_now = jnp.logical_and(can_start, start_prob < start_p)
-
-        # Sample new force if starting; otherwise keep previous
-        rng, new_force6 = lax.cond(
-            start_now,
-            lambda r: self._sample_push_force6(r, push_cfg),
-            lambda r: (r, prev_force6),
-            operand=rng,
-        )
-
-        # Update timers
-        new_steps = lax.select(start_now, duration_steps.astype(jnp.int32), steps_rem)
-        active = new_steps > 0
-        steps_after = jnp.where(active, new_steps - 1, new_steps)
-
-        idle = jnp.logical_not(active)
-        cooldown_dec = jnp.maximum(cooldown - 1, 0)
-        new_cooldown = lax.select(
-            start_now,
-            min_interval_steps.astype(jnp.int32),
-            jnp.where(idle, cooldown_dec, cooldown),
-        )
-
-        force6_to_apply = jnp.where(active, new_force6, jnp.zeros_like(new_force6))
-
-        return rng, force6_to_apply
-
-    def _apply_external_force(self, data: mjx.Data, force6: jax.Array) -> mjx.Data:
-        """Apply a 6D wrench to the configured body."""
-        # Build xfrc_applied array
-        xfrc = jnp.zeros((self._mjx_model.nbody, 6), dtype=data.xfrc_applied.dtype)
-        xfrc = xfrc.at[self._push_target_body_id].set(force6)
-
-        # DEBUG: Print the applied force for debugging
-        # jax.debug.print("Applied external force: {force} to body {body_id}", 
-        #                 force=force6, body_id=self._push_target_body_id)
-
-        return data.replace(xfrc_applied=xfrc)
 
     def _pd_control(
             self,

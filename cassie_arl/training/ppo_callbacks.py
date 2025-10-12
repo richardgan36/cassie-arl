@@ -199,7 +199,7 @@ class VisualizePolicyCallback:
     # ----------------------------- Logging Helpers -------------------------------
     def _log_header(self, current_step: int):
         print("")
-        logging.info("--- Visualization update ---")
+        logging.info(f"--- Visualization update {self._call_count} ---")
         logging.info(f"Generating rollout video at step {current_step}")
 
     def _log_footer(self, start_time: float):
@@ -419,7 +419,6 @@ class VisualizePolicyCallback:
         scene_option.flags[mj.mjtVisFlag.mjVIS_TRANSPARENT] = False
         scene_option.flags[mj.mjtVisFlag.mjVIS_PERTFORCE] = True
         scene_option.flags[mj.mjtVisFlag.mjVIS_PERTOBJ] = True  # Try perturbation objects
-        scene_option.flags[mj.mjtVisFlag.mjVIS_INERTIA] = True  # Try to visualize inertia to test
 
         # Helper to render a single frame for a given state index
         def render_one(i: int) -> np.ndarray:
