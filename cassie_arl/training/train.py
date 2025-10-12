@@ -37,7 +37,7 @@ ppo_training_params = {
     'max_grad_norm': 1.0,
     'normalize_observations': True,
     'num_envs': 4096,
-    'num_evals': 25,
+    'num_evals': 22,
     'num_minibatches': 32,
     'num_resets_per_eval': 1,
     'num_timesteps': 150_000_000,
@@ -48,7 +48,7 @@ ppo_training_params = {
 }
 
 train_id = "parameterized_pd"  # Try to use PD control
-iteration = 3
+iteration = 6
 test_mode = False  # If True, run a short training for testing purposes
 env = CassieEnv()
 
@@ -79,7 +79,7 @@ logging.info("PPO training parameters:")
 logging.info(ppo_training_params)
 
 save_ckpt_dir = script_dir / "checkpoints" / f"{train_id}" / f"iter_{iteration:02d}"
-restore_ckpt_path = script_dir / "checkpoints/parameterized_pd_2/000032768000"
+restore_ckpt_path = script_dir / "checkpoints/parameterized_pd/iter_03/000013107200"
 
 # Instantiate callback objects
 progress_cb = ProgressCallback(ppo_training_params, script_dir, train_id, iteration, save_plot=True)

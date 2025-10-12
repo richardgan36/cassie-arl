@@ -79,15 +79,15 @@ def default_config() -> config_dict.ConfigDict:
 
         # --- Reset noise configuration ---
         reset_noise_config=config_dict.create(
-            level=1.2,  # Set to 0.0 to disable noise.
+            level=1.0,  # Set to 0.0 to disable noise.
             scales=config_dict.create(
                 xy=jnp.array([-0.1, 0.1]),            # Additive
                 z=jnp.array([0, 0.05]),               # Additive
                 yaw=jnp.array([-3.14, 3.14]),         # Additive
-                roll_pitch=jnp.array([-0.05, 0.05]),  # Additive
-                motors=jnp.array([-0.03, 0.03]),      # Multiplicative: Motors *= U(1-0.03, 1+0.03)
-                dxyz=jnp.array([-0.1, 0.1]),          # Additive
-                drpy=jnp.array([-0.12, 0.12]),        # Additive
+                roll_pitch=jnp.array([-0.1, 0.1]),  # Additive
+                motors=jnp.array([-0.07, 0.07]),      # Multiplicative: Motors *= U(1-0.07, 1+0.07)
+                dxyz=jnp.array([-0.3, 0.3]),          # Additive
+                drpy=jnp.array([-0.2, 0.2]),        # Additive
             ),
         ),
 
@@ -100,7 +100,7 @@ def default_config() -> config_dict.ConfigDict:
                 pelvis_ang_vel=-0.6,  # Initially -0.4 but increased to encourage stability
                 pelvis_tilt=-0.2,  # The standing pose found by the agent has a slight tilt, so this cost is reduced to avoid penalizing that too much
                 motor_ref_error=-0.0,  # Initially -0.8 but removed because the agent learnt a standing pose that is different from the reference pose
-                action_rate=-0.2,
+                action_rate=-0.3,
                 torques=-0.05,
                 gain_rate=-0.0,  # Initially -0.1 to encourate constant gains but removed now that the agent has already learned this behavior 
             ),
