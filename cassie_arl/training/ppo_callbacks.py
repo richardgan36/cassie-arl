@@ -411,14 +411,14 @@ class VisualizePolicyCallback:
 
         # Pre-create scene option once
         scene_option = mj.MjvOption()
+        scene_option.geomgroup[1] = True  # Show frames?
         scene_option.geomgroup[2] = True
         scene_option.geomgroup[3] = False
         scene_option.flags[mj.mjtVisFlag.mjVIS_CONTACTPOINT] = True
-        scene_option.flags[mj.mjtVisFlag.mjVIS_CONTACTFORCE] = True
+        scene_option.flags[mj.mjtVisFlag.mjVIS_CONTACTFORCE] = False
         scene_option.flags[mj.mjtVisFlag.mjVIS_COM] = True
         scene_option.flags[mj.mjtVisFlag.mjVIS_TRANSPARENT] = False
         scene_option.flags[mj.mjtVisFlag.mjVIS_PERTFORCE] = True
-        scene_option.flags[mj.mjtVisFlag.mjVIS_PERTOBJ] = True  # Try perturbation objects
 
         # Helper to render a single frame for a given state index
         def render_one(i: int) -> np.ndarray:

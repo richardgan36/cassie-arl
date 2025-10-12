@@ -49,7 +49,7 @@ ppo_training_params = {
 
 train_id = "add_pushes"
 iteration = 1
-test_mode = True
+test_mode = False
 env = CassieEnv()
 
 # JIT-wrapped env functions kept as local variables and passed into the visualization callback
@@ -73,7 +73,7 @@ if test_mode:
     ppo_training_params["num_minibatches"] = 4
     ppo_training_params["batch_size"] = 2
     ppo_training_params["unroll_length"] = 8
-    ppo_training_params["num_timesteps"] = 110
+    ppo_training_params["num_timesteps"] = 8
 
 logging.info("PPO training parameters:")
 logging.info(ppo_training_params)

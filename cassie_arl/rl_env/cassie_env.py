@@ -66,7 +66,7 @@ def default_config() -> config_dict.ConfigDict:
         # --------------------------------
         ctrl_dt=0.01,  # 100 Hz
         sim_dt=0.002,  # Match "timestep" in MJCF
-        episode_length=1000,  # 10 seconds at ctrl_dt=0.01
+        episode_length=800,  # 8 seconds at ctrl_dt=0.01
 
         # -------------------
         # Custom parameters
@@ -87,7 +87,7 @@ def default_config() -> config_dict.ConfigDict:
 
         # --- Reset noise configuration ---
         reset_noise_config=config_dict.create(
-            level=1.0,  # Set to 0.0 to disable noise.
+            level=0.5,  # Set to 0.0 to disable noise.
             scales=config_dict.create(
                 xy=jnp.array([-0.1, 0.1]),            # Additive
                 z=jnp.array([0, 0.05]),               # Additive
@@ -102,40 +102,36 @@ def default_config() -> config_dict.ConfigDict:
         # --- Reward function configuration ---
         reward_config=config_dict.create(
             weights=config_dict.create(
-                alive=1.5,  # Initially 2.0 but reduced since other costs have been reduced
+                alive=1.8,
                 pelvis_height=-0.0,  # Initially -0.3, but after training, the agent discovers it can get high reward without tracking height closely
                 pelvis_lin_vel=-0.5,  # Initially -0.3 but increased to encourage stability
                 pelvis_ang_vel=-0.6,  # Initially -0.4 but increased to encourage stability
                 pelvis_tilt=-0.2,  # The standing pose found by the agent has a slight tilt, so this cost is reduced to avoid penalizing that too much
                 motor_ref_error=-0.0,  # Initially -0.8 but removed because the agent learnt a standing pose that is different from the reference pose
-                action_rate=-0.3,
+                action_rate=-0.5,
                 torques=-0.05,
-                gain_rate=-0.0,  # Initially -0.1 to encourate constant gains but removed now that the agent has already learned this behavior 
+                gain_rate=-0.1,  # Initially -0.1 to encourate constant gains but removed now that the agent has already learned this behavior 
             ),
         ),
 
         # --- Push configuration ---
         push_config=config_dict.create(
             enabled=True,
+            target_body="cassie-pelvis",
             
             force_ranges=config_dict.create(
-                x=jnp.array([40.0, 60.0]),   # Forward/backward
-                y=jnp.array([0.0, 0.0]),     # Left/right
-                z=jnp.array([0.0, 0.0]),     # Up/down
+                x=jnp.array([25.0, 40.0]),   # Forward/backward
+                y=jnp.array([15.0, 30.0]),     # Left/right
+                z=jnp.array([5.0, 20.0]),     # Up/down
             ),
 
             # Torque range [min, max] in N⋅m
-            torque_range=jnp.array([0.0, 20.0]),
+            torque_range=jnp.array([0.0, 0.0]),
             
             # Push timing
-            interval_range=jnp.array([1.0, 2.0]),    # Time between pushes (seconds)
-            duration_range=jnp.array([0.05, 0.1]),   # Push duration (seconds)
-            
-            # Training progression
-            push_start_time=1.5,  # Delay before first push (let policy stabilize)
-            
-            # Target body (can be overridden, defaults to pelvis)
-            target_body="cassie-pelvis",
+            push_start_time=1.0,  # Delay before first push (let policy stabilize)
+            interval_range=jnp.array([0.7, 1.8]),    # Time between pushes (seconds)
+            duration_range=jnp.array([0.2, 0.3]),   # Push duration (seconds)
         )
     )
 
@@ -158,6 +154,12 @@ class CassieEnv(mjx_env.MjxEnv):
 
         self._mj_model.vis.global_.offwidth = 3840
         self._mj_model.vis.global_.offheight = 2160
+        
+        # Make force arrows more visible for small forces
+        self._mj_model.vis.scale.forcewidth = 0.08  # Thickness of force arrows
+        self._mj_model.vis.scale.framewidth = 0.02  # General frame thickness
+        # Scale factor for force visualization - makes small forces appear larger
+        self._mj_model.vis.map.force = 0.05  # Lower values make arrows longer for same force magnitude
 
         self._post_init()
 
