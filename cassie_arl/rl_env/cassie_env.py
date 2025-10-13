@@ -42,6 +42,7 @@ class RewardComponents:
     action_rate: jax.Array
     torques: jax.Array
     gain_rate: jax.Array
+    com_stability: jax.Array  # NEW: Reward for keeping CoM over support polygon
 
     @classmethod
     def zeros(cls) -> "RewardComponents":
@@ -56,6 +57,7 @@ class RewardComponents:
             action_rate=z,
             torques=z,
             gain_rate=z,
+            com_stability=z,
         )
 
 
@@ -104,13 +106,14 @@ def default_config() -> config_dict.ConfigDict:
             weights=config_dict.create(
                 alive=1.8,
                 pelvis_height=-0.0,  # Initially -0.3, but after training, the agent discovers it can get high reward without tracking height closely
-                pelvis_lin_vel=-0.5,  # Initially -0.3 but increased to encourage stability
-                pelvis_ang_vel=-0.6,  # Initially -0.4 but increased to encourage stability
+                pelvis_lin_vel=-0.2,  # Reduced from -0.5 to allow recovery motions
+                pelvis_ang_vel=-0.3,  # Reduced from -0.6 to allow recovery motions
                 pelvis_tilt=-0.2,  # The standing pose found by the agent has a slight tilt, so this cost is reduced to avoid penalizing that too much
                 motor_ref_error=-0.0,  # Initially -0.8 but removed because the agent learnt a standing pose that is different from the reference pose
-                action_rate=-0.5,
+                action_rate=-0.2,  # Reduced from -0.5 to allow faster reactions
                 torques=-0.05,
-                gain_rate=-0.1,  # Initially -0.1 to encourate constant gains but removed now that the agent has already learned this behavior 
+                gain_rate=-0.0,  # Set to 0 to allow dynamic gain adjustment during recovery
+                com_stability=1.5,  # NEW: Strong reward for keeping CoM over support
             ),
         ),
 
@@ -518,6 +521,7 @@ class CassieEnv(mjx_env.MjxEnv):
             "action_rate": self._cost_action_rate(pos_targets, info["pos_targets"]),
             "torques": self._cost_torques(torques),
             "gain_rate": gain_rate_cost,
+            "com_stability": self._reward_com_stability(data),
         }
 
         return per_step_rewards
@@ -607,6 +611,45 @@ class CassieEnv(mjx_env.MjxEnv):
         cost_d = jnp.mean((dd ** 2)) * self._inv_d_gain_rate_scale_sq
         cost = 0.5 * (cost_p + cost_d)
         return jnp.clip(cost, 0.0, 1.0)
+
+    def _reward_com_stability(self, data: mjx.Data) -> jax.Array:
+        """Reward for keeping center of mass (CoM) projection over support polygon.
+        
+        This is the key reward for learning active recovery behaviors. When CoM
+        moves outside the support polygon, the agent must take corrective actions
+        (stepping, shifting weight) to regain balance.
+        
+        Returns:
+            Reward in [0, 1] based on how well CoM is centered over support.
+        """
+        # Get foot positions (x, y coordinates only)
+        left_foot_pos = data.xpos[self._left_foot_id, :2]  # (2,)
+        right_foot_pos = data.xpos[self._right_foot_id, :2]  # (2,)
+        
+        # Compute center of support polygon (midpoint between feet)
+        support_center = (left_foot_pos + right_foot_pos) / 2.0
+        
+        # Get CoM position (x, y only) - using subtree_com for pelvis
+        # MuJoco's subtree_com gives CoM in world coordinates
+        pelvis_com = data.subtree_com[self._pelvis_id, :2]
+        
+        # Distance from CoM projection to support center
+        com_offset = pelvis_com - support_center
+        com_dist = jnp.linalg.norm(com_offset)
+        
+        # Also compute foot separation to normalize the reward
+        foot_separation = jnp.linalg.norm(left_foot_pos - right_foot_pos)
+        
+        # Reward is high when CoM is within the support polygon
+        # Normalize by foot separation so reward scale adapts to stance width
+        # Target: CoM should be within ~0.5 * foot_separation of center
+        normalized_dist = com_dist / (foot_separation + 0.01)  # Add small constant to avoid division by zero
+        
+        # Exponential reward: high when CoM is centered, drops off as it moves toward edges
+        # Scale factor of 2.0 means reward ~0.37 when CoM is at half the foot separation
+        reward = jnp.exp(-2.0 * normalized_dist)
+        
+        return jnp.clip(reward, 0.0, 1.0)
 
     def _get_termination(self, data: mjx.Data, step: jax.Array) -> jax.Array:
         """Return True if Cassie has fallen or max timesteps reached."""
