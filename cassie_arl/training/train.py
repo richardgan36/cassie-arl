@@ -37,10 +37,10 @@ ppo_training_params = {
     'max_grad_norm': 1.0,
     'normalize_observations': True,
     'num_envs': 4096,
-    'num_evals': 22,
+    'num_evals': 30,
     'num_minibatches': 32,
     'num_resets_per_eval': 1,
-    'num_timesteps': 150_000_000,
+    'num_timesteps': 200_000_000,
     'num_updates_per_batch': 4,
     'reward_scaling': 1.0,
     'unroll_length': 20,
@@ -79,7 +79,7 @@ logging.info("PPO training parameters:")
 logging.info(ppo_training_params)
 
 save_ckpt_dir = script_dir / "checkpoints" / f"{train_id}" / f"iter_{iteration:02d}"
-restore_ckpt_path = script_dir / "checkpoints/parameterized_pd/iter_05/000015728640"
+restore_ckpt_path = script_dir / "checkpoints/add_pushes/iter_01/000094371840"
 
 # Instantiate callback objects
 progress_cb = ProgressCallback(
@@ -97,7 +97,7 @@ viz_cb = VisualizePolicyCallback(
     train_id,
     iteration,
     run_every_n_calls=1,
-    skip_first_n_calls=0,
+    skip_first_n_calls=1,
     test_mode=test_mode
 )
 

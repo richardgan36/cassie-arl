@@ -28,6 +28,7 @@ logging.set_verbosity(logging.INFO)
 
 class ProgressCallback:
     """Callable progress callback for Brax PPO training loop."""
+    # TODO: add mean episode length metric
     def __init__(
             self,
             num_timesteps: dict,
@@ -52,6 +53,8 @@ class ProgressCallback:
         self.y_data.append(metrics["eval/episode_reward"])
         self.y_dataerr.append(metrics["eval/episode_reward_std"])
 
+        mean_episode_length = metrics.get("eval/episode_length", None)
+
         print("")
         logging.info("--- Progress update ---")
         logging.info(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -65,6 +68,10 @@ class ProgressCallback:
             last_step = self.x_data[-2] if len(self.x_data) >= 2 else None
             logging.info(f"Steps: {num_steps}, Reward: {self.y_data[-1]:.3f} ± {self.y_dataerr[-1]:.3f}")
             logging.info(f"Time since last progress call (steps {last_step} -> {num_steps}): {delta}")
+
+        if mean_episode_length is not None:
+            logging.info(f"Mean Episode Length: {mean_episode_length:.3f}")
+
         print("-----------------")
 
         plt.clf()  # Clear the current figure
@@ -401,6 +408,7 @@ class VisualizePolicyCallback:
 
         Returns base_name, path, and control dt (for plots).
         """
+        # TODO: add text for push force
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         base_name = f"rollout_step{current_step}-{timestamp}"
         ani_save_path = self.ani_save_dir / f"{base_name}.mp4"

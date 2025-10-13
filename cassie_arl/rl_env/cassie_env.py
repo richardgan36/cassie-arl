@@ -120,9 +120,9 @@ def default_config() -> config_dict.ConfigDict:
             target_body="cassie-pelvis",
             
             force_ranges=config_dict.create(
-                x=jnp.array([25.0, 40.0]),   # Forward/backward
-                y=jnp.array([15.0, 30.0]),     # Left/right
-                z=jnp.array([5.0, 20.0]),     # Up/down
+                x=jnp.array([15.0, 35.0]),   # Forward/backward
+                y=jnp.array([10.0, 25.0]),     # Left/right
+                z=jnp.array([0.0, 10.0]),     # Up/down
             ),
 
             # Torque range [min, max] in N⋅m
@@ -130,8 +130,8 @@ def default_config() -> config_dict.ConfigDict:
             
             # Push timing
             push_start_time=1.0,  # Delay before first push (let policy stabilize)
-            interval_range=jnp.array([0.7, 1.8]),    # Time between pushes (seconds)
-            duration_range=jnp.array([0.2, 0.3]),   # Push duration (seconds)
+            interval_range=jnp.array([0.8, 2.0]),    # Time between pushes (seconds)
+            duration_range=jnp.array([0.15, 0.25]),   # Push duration (seconds)
         )
     )
 
@@ -139,6 +139,7 @@ def default_config() -> config_dict.ConfigDict:
 class CassieEnv(mjx_env.MjxEnv):
     """Cassie environment built on MJX, compatible with Brax PPO."""
     # TODO: add metrics
+    # TODO: add mean rewad
 
     def __init__(
             self,
