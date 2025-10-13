@@ -16,6 +16,7 @@ from cassie_arl.training.ppo_callbacks import ProgressCallback, VisualizePolicyC
 script_dir = Path(__file__).parent.resolve()
 logging.set_verbosity(logging.INFO)
 
+
 network_factory_params = {
     "policy_hidden_layer_sizes": (512, 256, 128),
     # "policy_obs_key": "state",
@@ -47,7 +48,7 @@ ppo_training_params = {
 }
 
 train_id = "active_recovery"
-iteration = 1
+iteration = 2
 test_mode = False
 env = CassieEnv()
 
@@ -77,7 +78,7 @@ logging.info("PPO training parameters:")
 logging.info(ppo_training_params)
 
 save_ckpt_dir = script_dir / "checkpoints" / f"{train_id}" / f"iter_{iteration:02d}"
-restore_ckpt_path = script_dir / "checkpoints/add_pushes/iter_01/000094371840"
+restore_ckpt_path = script_dir / "checkpoints/active_recovery/iter_01/000043253760"
 
 # Instantiate callback objects
 progress_cb = ProgressCallback(

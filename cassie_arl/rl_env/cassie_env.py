@@ -68,7 +68,7 @@ def default_config() -> config_dict.ConfigDict:
         # --- Reward function configuration ---
         reward_config=config_dict.create(
             weights=config_dict.create(
-                alive=0.8,
+                alive=0.7,
                 # pelvis_height=-0.0,  # Initially -0.3, but after training, the agent discovers it can get high reward without tracking height closely
                 pelvis_lin_vel=-0.2,  # Reduced from -0.5 to allow recovery motions
                 pelvis_ang_vel=-0.3,  # Reduced from -0.6 to allow recovery motions
@@ -77,8 +77,8 @@ def default_config() -> config_dict.ConfigDict:
                 action_rate=-0.2,  # Reduced from -0.5 to allow faster reactions
                 torques=-0.05,
                 gain_rate=-0.0,  # Set to 0 to allow dynamic gain adjustment during recovery
-                com_stability=1.0,
-                feet_separation=-0.3
+                com_stability=1.1,
+                feet_separation=-0.4
             ),
         ),
 
@@ -88,8 +88,8 @@ def default_config() -> config_dict.ConfigDict:
             target_body="cassie-pelvis",
             
             force_ranges=config_dict.create(
-                x=jnp.array([15.0, 35.0]),   # Forward/backward
-                y=jnp.array([10.0, 25.0]),     # Left/right
+                x=jnp.array([20.0, 40.0]),   # Forward/backward
+                y=jnp.array([15.0, 30.0]),     # Left/right
                 z=jnp.array([0.0, 10.0]),     # Up/down
             ),
 

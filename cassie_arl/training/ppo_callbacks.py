@@ -57,9 +57,6 @@ class ProgressCallback:
         print("")
         logging.info(f"--- Progress update {self._call_count} ---")
 
-        #DEBUG
-        logging.info(f"Metrics keys: {list(metrics.keys())}")
-
         logging.info(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         logging.info(f"Steps: {num_steps}")
         logging.info(f"Reward: {self.y_data[-1]:.2f} ± {self.y_dataerr[-1]:.2f}")
