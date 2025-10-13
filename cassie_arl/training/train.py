@@ -10,7 +10,6 @@ from absl import logging
 from mujoco_playground import wrapper
 
 from cassie_arl.rl_env.cassie_env import CassieEnv
-from cassie_arl.rl_env.cassie_domain_randomizer import domain_randomize
 from cassie_arl.training.ppo_callbacks import ProgressCallback, VisualizePolicyCallback
 
 
@@ -38,7 +37,7 @@ ppo_training_params = {
     'normalize_observations': True,
     'num_envs': 4096,
     'num_evals': 30,
-    'num_minibatches': 32,
+    'num_minibatches': 16,
     'num_resets_per_eval': 1,
     'num_timesteps': 200_000_000,
     'num_updates_per_batch': 4,
@@ -49,7 +48,7 @@ ppo_training_params = {
 
 train_id = "active_recovery"
 iteration = 1
-test_mode = True
+test_mode = False
 env = CassieEnv()
 
 # JIT-wrapped env functions kept as local variables and passed into the visualization callback
@@ -68,11 +67,10 @@ if test_mode:
     logging.info("\n----------\nRunning in testing mode.\n----------")
     # --- Shorten training for testing ---
     ppo_training_params["num_evals"] = 4
-    ppo_training_params["episode_length"] = 5
-    ppo_training_params["num_envs"] = 1
+    ppo_training_params["num_envs"] = 8
+    ppo_training_params["learning_rate"] = 1e-6
     ppo_training_params["num_minibatches"] = 4
     ppo_training_params["batch_size"] = 2
-    ppo_training_params["unroll_length"] = 8
     ppo_training_params["num_timesteps"] = 10
 
 logging.info("PPO training parameters:")

@@ -1,4 +1,4 @@
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Tuple, Union
 from pathlib import Path
 
 import jax
@@ -6,7 +6,6 @@ import jax.numpy as jnp
 from jax import lax
 import mujoco as mj
 import mujoco.mjx as mjx
-from flax import struct
 from ml_collections import config_dict
 from mujoco_playground._src import mjx_env
 
@@ -24,43 +23,6 @@ from cassie_arl.config.cassie_consts import (
 
 script_dir = Path(__file__).parent
 CASSIE_SCENE_XML = script_dir.parent / "models" / "scene.xml"
-
-
-@struct.dataclass
-class RewardComponents:
-    """PyTree for per-step reward components kept in state.info.
-
-    Storing rewards in a dataclass makes the structure static and JIT-friendly
-    (vs an arbitrary dict). All leaves are jax.Arrays with scalar shape ().
-    """
-    alive: jax.Array
-    pelvis_height: jax.Array
-    pelvis_lin_vel: jax.Array
-    pelvis_ang_vel: jax.Array
-    pelvis_tilt: jax.Array
-    motor_ref_error: jax.Array
-    action_rate: jax.Array
-    torques: jax.Array
-    gain_rate: jax.Array
-    com_stability: jax.Array
-    feet_separation: jax.Array
-
-    @classmethod
-    def zeros(cls) -> "RewardComponents":
-        z = jnp.zeros(())
-        return cls(
-            alive=z,
-            pelvis_height=z,
-            pelvis_lin_vel=z,
-            pelvis_ang_vel=z,
-            pelvis_tilt=z,
-            motor_ref_error=z,
-            action_rate=z,
-            torques=z,
-            gain_rate=z,
-            com_stability=z,
-            feet_separation=z
-        )
 
 
 def default_config() -> config_dict.ConfigDict:
@@ -106,12 +68,12 @@ def default_config() -> config_dict.ConfigDict:
         # --- Reward function configuration ---
         reward_config=config_dict.create(
             weights=config_dict.create(
-                alive=1.0,
-                pelvis_height=-0.0,  # Initially -0.3, but after training, the agent discovers it can get high reward without tracking height closely
+                alive=0.8,
+                # pelvis_height=-0.0,  # Initially -0.3, but after training, the agent discovers it can get high reward without tracking height closely
                 pelvis_lin_vel=-0.2,  # Reduced from -0.5 to allow recovery motions
                 pelvis_ang_vel=-0.3,  # Reduced from -0.6 to allow recovery motions
                 pelvis_tilt=-0.2,  # The standing pose found by the agent has a slight tilt, so this cost is reduced to avoid penalizing that too much
-                motor_ref_error=-0.0,  # Initially -0.8 but removed because the agent learnt a standing pose that is different from the reference pose
+                # motor_ref_error=-0.0,  # Initially -0.8 but removed because the agent learnt a standing pose that is different from the reference pose
                 action_rate=-0.2,  # Reduced from -0.5 to allow faster reactions
                 torques=-0.05,
                 gain_rate=-0.0,  # Set to 0 to allow dynamic gain adjustment during recovery
@@ -135,7 +97,6 @@ def default_config() -> config_dict.ConfigDict:
             torque_range=jnp.array([0.0, 0.0]),
             
             # Push timing
-            push_start_time=1.0,  # Delay before first push (let policy stabilize)
             interval_range=jnp.array([1.75, 2.5]),    # Time between pushes (seconds)
             duration_range=jnp.array([0.15, 0.20]),   # Push duration (seconds)
         )
@@ -144,8 +105,6 @@ def default_config() -> config_dict.ConfigDict:
 
 class CassieEnv(mjx_env.MjxEnv):
     """Cassie environment built on MJX, compatible with Brax PPO."""
-    # TODO: add metrics
-    # TODO: add mean reward for each component
 
     def __init__(
             self,
@@ -294,7 +253,6 @@ class CassieEnv(mjx_env.MjxEnv):
         info = {
             "rng": rng,
             "step": 0,
-            "reward_components": RewardComponents.zeros(),
             "pos_targets": jnp.zeros((self._mjx_model.nu,)),
             # Store last per-joint PD gains to compute gain-rate cost
             "last_p_gains": jnp.zeros((self._mjx_model.nu,)),
@@ -304,13 +262,35 @@ class CassieEnv(mjx_env.MjxEnv):
             # Push state
             "push_state": push_state,
         }
+        
+        # Initialize metrics with reward components (all zeros at reset)
+        # Always include a 'reward' metric to keep the pytree structure
+        # constant across training and action repeats.
+        metrics = {
+            **{
+                f"reward_component/{k}": jnp.zeros(())
+                for k in [
+                    "alive",
+                    "pelvis_lin_vel",
+                    "pelvis_ang_vel",
+                    "pelvis_tilt",
+                    "action_rate",
+                    "torques",
+                    "gain_rate",
+                    "com_stability",
+                    "feet_separation",
+                ]
+            },
+            # Brax training wrappers expect a 'reward' metric present.
+            "reward": jnp.zeros(()),
+        }
 
         return mjx_env.State(
             data=data,
             obs=obs,
             reward=jnp.zeros(()),
             done=jnp.zeros(()),
-            metrics={},
+            metrics=metrics,
             info=info,
         )
 
@@ -326,34 +306,7 @@ class CassieEnv(mjx_env.MjxEnv):
         """
         rng = state.info["rng"]
 
-        # Action consists of joint deltas + PD gains
-        nu = self._mjx_model.nu
-        jnt_deltas_raw = action[:nu]
-        p_gains_raw = action[nu:nu+3]  # Kp for [hip roll/yaw], [hip pitch / knee], [foot]
-        d_gains_raw = action[nu+3:]    # Kd for same groups
-
-        p_gains_raw_scaled = (p_gains_raw + 1.0) / 2.0 * self._config.max_p_gain  # Ensure positive
-        d_gains_raw_scaled = (d_gains_raw + 1.0) / 2.0 * self._config.max_d_gain  # Ensure positive
-        # Expand grouped gains to per-joint gains (10 actuated joints):
-        # per leg order = [hip roll, hip yaw, hip pitch, knee, foot]
-        per_leg_p = jnp.array([
-            p_gains_raw_scaled[0],  # hip roll
-            p_gains_raw_scaled[0],  # hip yaw
-            p_gains_raw_scaled[1],  # hip pitch
-            p_gains_raw_scaled[1],  # knee
-            p_gains_raw_scaled[2],  # foot
-        ])
-        per_leg_d = jnp.array([
-            d_gains_raw_scaled[0],
-            d_gains_raw_scaled[0],
-            d_gains_raw_scaled[1],
-            d_gains_raw_scaled[1],
-            d_gains_raw_scaled[2],
-        ])
-        p_gains = jnp.tile(per_leg_p, 2)  # (10,)
-        d_gains = jnp.tile(per_leg_d, 2)  # (10,)
-
-        pos_targets = self._action_to_jnt_targets(jnt_deltas_raw)  # The first 10 actions are joint angle deltas in [-1, 1]
+        pos_targets, p_gains, d_gains = self._parse_action(action)
 
         # Update push system and get current wrench to apply
         current_time = state.info.get("step", 0) * self.dt
@@ -374,10 +327,10 @@ class CassieEnv(mjx_env.MjxEnv):
             
             # Apply push force using the push system
             data_next = apply_wrench_to_body(
-                data_carry, 
-                self._push_target_body_id, 
-                push_wrench, 
-                self._mjx_model
+                self._mjx_model,
+                data_carry,
+                self._push_target_body_id,
+                push_wrench,
             )
             data_next = mjx_env.step(self._mjx_model, data_next, tau, 1)
             return (data_next, tau)
@@ -421,18 +374,27 @@ class CassieEnv(mjx_env.MjxEnv):
             **state.info,
             "step": new_step,
             "rng": rng,
-            "reward_components": RewardComponents(**per_step_weighted),
             "pos_targets": pos_targets,
             "last_p_gains": p_gains,
             "last_d_gains": d_gains,
             "obs_history": new_hist,
             "push_state": push_state,
         }
+        
+        # Add reward components to metrics for aggregation during evaluation
+        # Brax automatically computes mean and std across eval episodes
+        # Always include the scalar 'reward' so metrics pytree structure is stable.
+        metrics = {
+            **{f"reward_component/{k}": v for k, v in per_step_weighted.items()},
+            "reward": reward,  # Brax training wrappers expect a 'reward' metric present.
+        }
+        
         return state.replace(
             data=data,
             obs=obs,
             reward=reward,
             done=done,
+            metrics=metrics,
             info=new_info
         )
 
@@ -513,11 +475,11 @@ class CassieEnv(mjx_env.MjxEnv):
 
         per_step_rewards = {
             "alive": self._reward_alive(),
-            "pelvis_height": self._cost_pelvis_height(data),
+            # "pelvis_height": self._cost_pelvis_height(data),
             "pelvis_lin_vel": self._cost_pelvis_lin_vel(data),
             "pelvis_ang_vel": self._cost_pelvis_ang_vel(data),
             "pelvis_tilt": self._cost_pelvis_tilt(data),
-            "motor_ref_error": self._cost_motor_reference_error(data),
+            # "motor_ref_error": self._cost_motor_reference_error(data),
             "action_rate": self._cost_action_rate(pos_targets, info["pos_targets"]),
             "torques": self._cost_torques(torques),
             "gain_rate": gain_rate_cost,
@@ -642,7 +604,7 @@ class CassieEnv(mjx_env.MjxEnv):
         normalized_dist = com_dist / (foot_separation + 0.01)  # Add small constant to avoid division by zero
         
         # Exponential reward: high when CoM is centered, drops off as it moves toward edges
-        # Scale factor of 2.0 means reward ~0.37 when CoM is at half the foot separation
+        # Scale factor of 2.5 means reward ~0.37 when CoM is at 1/2.5 the foot separation
         reward = jnp.exp(-2.5 * normalized_dist)
         
         return jnp.clip(reward, 0.0, 1.0)
@@ -658,7 +620,7 @@ class CassieEnv(mjx_env.MjxEnv):
         
         foot_separation = jnp.linalg.norm(left_foot_pos - right_foot_pos)
         
-        desired_separation = 0.268  # meters
+        desired_separation = 0.27  # meters
         scale = 0.04
 
         cost = jnp.square((foot_separation - desired_separation) / scale)
@@ -692,13 +654,46 @@ class CassieEnv(mjx_env.MjxEnv):
         
         return jnp.logical_or(left_hit, right_hit)
 
-    def _action_to_jnt_targets(self, joint_deltas_normalized: jax.Array) -> jax.Array:
-        """Scales normalized actions [-1, 1] to motor joint angles.
+    def _parse_action(self, action: jax.Array) -> Tuple[jax.Array, jax.Array, jax.Array]:
+        """Splits action into joint position targets, P gains, and D gains."""
+        # Action consists of [10 joint deltas, 3 grouped P gains, 3 grouped D gains]
+        nu = self._mjx_model.nu
+        jnt_deltas_raw = action[:nu]
+        pos_targets = self._joint_deltas_to_targets(jnt_deltas_raw)
+        
+        p_gains_raw = action[nu:nu+3]  # Kp for [hip roll/yaw], [hip pitch / knee], [foot]
+        d_gains_raw = action[nu+3:]    # Kd for same groups
 
-        The action is interpreted as normalized deltas of the 10 actuated
+        p_gains_raw_scaled = (p_gains_raw + 1.0) / 2.0 * self._config.max_p_gain  # Ensure positive
+        d_gains_raw_scaled = (d_gains_raw + 1.0) / 2.0 * self._config.max_d_gain  # Ensure positive
+        # Expand grouped gains to per-joint gains (10 actuated joints):
+        # per leg order = [hip roll, hip yaw, hip pitch, knee, foot]
+        per_leg_p = jnp.array([
+            p_gains_raw_scaled[0],  # hip roll
+            p_gains_raw_scaled[0],  # hip yaw
+            p_gains_raw_scaled[1],  # hip pitch
+            p_gains_raw_scaled[1],  # knee
+            p_gains_raw_scaled[2],  # foot
+        ])
+        per_leg_d = jnp.array([
+            d_gains_raw_scaled[0],
+            d_gains_raw_scaled[0],
+            d_gains_raw_scaled[1],
+            d_gains_raw_scaled[1],
+            d_gains_raw_scaled[2],
+        ])
+        p_gains = jnp.tile(per_leg_p, 2)  # (10,)
+        d_gains = jnp.tile(per_leg_d, 2)  # (10,)
+
+        return pos_targets, p_gains, d_gains
+
+    def _joint_deltas_to_targets(self, joint_deltas_normalized: jax.Array) -> jax.Array:
+        """Scales normalized joint deltas [-1, 1] to joint target angles.
+
+        `joint_deltas_normalized` (the first 10 elements of the action) 
+        are interpreted as normalized deltas of the 10 actuated
         joints from the standing pose angles. The scaling is linear:
-            delta = action * max_delta
-            target = standing + delta
+            target = standing + action * max_delta
         
         Note:
             The joint targets returned by this function do NOT respect

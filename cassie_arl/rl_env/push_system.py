@@ -225,10 +225,10 @@ class PushSystem:
 
 
 def apply_wrench_to_body(
+    model: mjx.Model,
     data: mjx.Data,
     body_id: int,
     wrench: jax.Array,
-    model: mjx.Model,
 ) -> mjx.Data:
     """
     Apply a 6D wrench (force + torque) to a specific body.

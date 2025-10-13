@@ -1,5 +1,4 @@
 """Callback functions passed into PPO training loop."""
-import dataclasses
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Callable
 from absl import logging
@@ -45,27 +44,58 @@ class ProgressCallback:
         self.y_data = []
         self.y_dataerr = []
         self.times = [datetime.now()]
+        self._call_count = 0
 
     def __call__(self, num_steps: int, metrics: types.Metrics | dict):
+        self._call_count += 1
+
         self.times.append(datetime.now())
         self.x_data.append(num_steps)
         self.y_data.append(metrics["eval/episode_reward"])
         self.y_dataerr.append(metrics["eval/episode_reward_std"])
 
         print("")
-        logging.info("--- Progress update ---")
+        logging.info(f"--- Progress update {self._call_count} ---")
+
+        #DEBUG
+        logging.info(f"Metrics keys: {list(metrics.keys())}")
+
         logging.info(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        logging.info(f"Steps: {num_steps}")
+        logging.info(f"Reward: {self.y_data[-1]:.2f} ± {self.y_dataerr[-1]:.2f}")
         logging.info(
-            f"Steps: {num_steps}, Reward: {self.y_data[-1]:.3f} "
-            f"± {self.y_dataerr[-1]:.3f}"
+            f"Episode length: {metrics['eval/avg_episode_length']:.0f} "
+            f"± {metrics['eval/std_episode_length']:.0f}"
         )
-        logging.info(
-            f"Episode length: {metrics["eval/avg_episode_length"]:.2f} "
-            f"± {metrics["eval/std_episode_length"]:.2f}"
-        )
-        logging.info(f"Entropy loss: {metrics["training/entropy_loss"]:.6f}")
-        logging.info(f"Policy loss: {metrics["training/policy_loss"]:.6f}")
-        logging.info(f"Value loss: {metrics["training/v_loss"]:.6f}")
+        # Training metrics may not be present (e.g., some Brax agents only emit eval/* here)
+        entropy_loss = metrics.get('training/entropy_loss')
+        policy_loss = metrics.get('training/policy_loss')
+        v_loss = metrics.get('training/v_loss')
+        if entropy_loss is not None:
+            logging.info(f"Entropy loss: {float(entropy_loss):.6f}")
+        if policy_loss is not None:
+            logging.info(f"Policy loss: {float(policy_loss):.6f}")
+        if v_loss is not None:
+            logging.info(f"Value loss: {float(v_loss):.6f}")
+
+        # Print reward component metrics if available
+        # In current Brax PPO, eval keys look like: eval/episode_reward_component/<name> and .../<name>_std
+        rc_prefix = "eval/episode_reward_component/"
+        reward_component_keys = [
+            k for k in metrics.keys()
+            if k.startswith(rc_prefix) and not k.endswith("_std")
+        ]
+        if reward_component_keys:
+            logging.info("\n--- Reward Components ---")
+            for key in sorted(reward_component_keys):
+                component_name = key[len(rc_prefix):]
+                mean_val = float(metrics[key])
+                std_key = f"{rc_prefix}{component_name}_std"
+                if std_key in metrics:
+                    std_val = float(metrics[std_key])
+                    logging.info(f"    {component_name}: {mean_val:.4f} ± {std_val:.4f}")
+                else:
+                    logging.info(f"    {component_name}: {mean_val:.4f}")
 
         if len(self.times) > 2:
             delta = self.times[-1] - self.times[-2]
@@ -219,21 +249,6 @@ class VisualizePolicyCallback:
         logging.info(f"Duration of visualization update: {duration}")
         logging.info("----------------")
 
-    # ----------------------------- Data Conversion -------------------------------
-    def _reward_components_to_dict(self, rc) -> Dict[str, float]:
-        """Best-effort conversion of reward components object to dict of floats."""
-        try:
-            if dataclasses.is_dataclass(rc):
-                out: Dict[str, float] = {}
-                for f in dataclasses.fields(rc):
-                    out[f.name] = float(np.array(getattr(rc, f.name)))
-                return out
-            if isinstance(rc, dict):
-                return {k: float(np.array(v)) for k, v in rc.items()}
-        except Exception:
-            pass
-        return {}
-
     # ----------------------------- Rollout Collection ----------------------------
     def _collect_rollout(self, current_step: int, inference_fn) -> 'VisualizePolicyCallback.RolloutData':
         rng = jax.random.PRNGKey(int(current_step + 1) & 0xFFFFFFFF)
@@ -285,7 +300,12 @@ class VisualizePolicyCallback:
     def _record_reward(self, state, data: 'VisualizePolicyCallback.RolloutData'):
         step_reward = float(state.reward)
         data.cumulative_reward += step_reward
-        components = self._reward_components_to_dict(state.info.get("reward_components", {}))
+        # Extract reward components from metrics instead of info
+        components = {}
+        for key, value in state.metrics.items():
+            if key.startswith("reward_component/"):
+                component_name = key.replace("reward_component/", "")
+                components[component_name] = float(np.array(value))
         data.reward_records.append(self.RewardRecord(components, step_reward, data.cumulative_reward))
 
     def _record_feet(self, state, data: 'VisualizePolicyCallback.RolloutData'):
