@@ -47,9 +47,9 @@ ppo_training_params = {
     'restore_value_fn': True,
 }
 
-train_id = "add_pushes"
+train_id = "active_recovery"
 iteration = 1
-test_mode = False
+test_mode = True
 env = CassieEnv()
 
 # JIT-wrapped env functions kept as local variables and passed into the visualization callback
@@ -67,13 +67,13 @@ network_factory = functools.partial(
 if test_mode:
     logging.info("\n----------\nRunning in testing mode.\n----------")
     # --- Shorten training for testing ---
-    ppo_training_params["num_evals"] = 2
+    ppo_training_params["num_evals"] = 4
     ppo_training_params["episode_length"] = 5
     ppo_training_params["num_envs"] = 1
     ppo_training_params["num_minibatches"] = 4
     ppo_training_params["batch_size"] = 2
     ppo_training_params["unroll_length"] = 8
-    ppo_training_params["num_timesteps"] = 8
+    ppo_training_params["num_timesteps"] = 10
 
 logging.info("PPO training parameters:")
 logging.info(ppo_training_params)
@@ -97,7 +97,7 @@ viz_cb = VisualizePolicyCallback(
     train_id,
     iteration,
     run_every_n_calls=1,
-    skip_first_n_calls=1,
+    skip_first_n_calls=0,
     test_mode=test_mode
 )
 

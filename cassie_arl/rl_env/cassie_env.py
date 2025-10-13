@@ -42,7 +42,8 @@ class RewardComponents:
     action_rate: jax.Array
     torques: jax.Array
     gain_rate: jax.Array
-    com_stability: jax.Array  # NEW: Reward for keeping CoM over support polygon
+    com_stability: jax.Array
+    feet_separation: jax.Array
 
     @classmethod
     def zeros(cls) -> "RewardComponents":
@@ -58,6 +59,7 @@ class RewardComponents:
             torques=z,
             gain_rate=z,
             com_stability=z,
+            feet_separation=z
         )
 
 
@@ -81,7 +83,7 @@ def default_config() -> config_dict.ConfigDict:
         # --- PD control parameters ---
         # Max Kp and Kd: the gains from the policy are scaled to [0, max]
         max_p_gain=8.0,  # Maximum Kp that can be learned by the agent
-        max_d_gain=0.8,  # Maximum Kd that can be learned by the agent
+        max_d_gain=1.0,  # Maximum Kd that can be learned by the agent
 
         # max_joint_delta_frac is the fraction of the total joint range
         # that the action can command as a delta from the standing pose.
@@ -104,7 +106,7 @@ def default_config() -> config_dict.ConfigDict:
         # --- Reward function configuration ---
         reward_config=config_dict.create(
             weights=config_dict.create(
-                alive=1.8,
+                alive=1.0,
                 pelvis_height=-0.0,  # Initially -0.3, but after training, the agent discovers it can get high reward without tracking height closely
                 pelvis_lin_vel=-0.2,  # Reduced from -0.5 to allow recovery motions
                 pelvis_ang_vel=-0.3,  # Reduced from -0.6 to allow recovery motions
@@ -113,7 +115,8 @@ def default_config() -> config_dict.ConfigDict:
                 action_rate=-0.2,  # Reduced from -0.5 to allow faster reactions
                 torques=-0.05,
                 gain_rate=-0.0,  # Set to 0 to allow dynamic gain adjustment during recovery
-                com_stability=1.5,  # NEW: Strong reward for keeping CoM over support
+                com_stability=1.0,
+                feet_separation=-0.3
             ),
         ),
 
@@ -133,8 +136,8 @@ def default_config() -> config_dict.ConfigDict:
             
             # Push timing
             push_start_time=1.0,  # Delay before first push (let policy stabilize)
-            interval_range=jnp.array([0.8, 2.0]),    # Time between pushes (seconds)
-            duration_range=jnp.array([0.15, 0.25]),   # Push duration (seconds)
+            interval_range=jnp.array([1.75, 2.5]),    # Time between pushes (seconds)
+            duration_range=jnp.array([0.15, 0.20]),   # Push duration (seconds)
         )
     )
 
@@ -142,7 +145,7 @@ def default_config() -> config_dict.ConfigDict:
 class CassieEnv(mjx_env.MjxEnv):
     """Cassie environment built on MJX, compatible with Brax PPO."""
     # TODO: add metrics
-    # TODO: add mean rewad
+    # TODO: add mean reward for each component
 
     def __init__(
             self,
@@ -162,8 +165,7 @@ class CassieEnv(mjx_env.MjxEnv):
         # Make force arrows more visible for small forces
         self._mj_model.vis.scale.forcewidth = 0.08  # Thickness of force arrows
         self._mj_model.vis.scale.framewidth = 0.02  # General frame thickness
-        # Scale factor for force visualization - makes small forces appear larger
-        self._mj_model.vis.map.force = 0.05  # Lower values make arrows longer for same force magnitude
+        self._mj_model.vis.map.force = 0.05  # Proportional to force arrow length
 
         self._post_init()
 
@@ -287,7 +289,7 @@ class CassieEnv(mjx_env.MjxEnv):
         obs = obs_history.reshape(-1)
 
         # Initialize push state
-        push_state = PushState.init(push_rng, self._config.push_config.push_start_time)
+        push_state = PushState.init(push_rng, self._config.push_config.interval_range)
 
         info = {
             "rng": rng,
@@ -497,8 +499,6 @@ class CassieEnv(mjx_env.MjxEnv):
         All rewards/costs are in [0, 1]. Their weights in self._config.reward_config.weights
         determine their relative importance and sign.
         """
-        # TODO: add cost for distance between feet (sometimes the robot has a very narrow stance)
-
         gain_rate_cost = lax.cond(
             jnp.array(info.get("step", 0)) == 0,
             lambda _: jnp.array(0.0),
@@ -522,6 +522,7 @@ class CassieEnv(mjx_env.MjxEnv):
             "torques": self._cost_torques(torques),
             "gain_rate": gain_rate_cost,
             "com_stability": self._reward_com_stability(data),
+            "feet_separation": self._cost_feet_separation(data)
         }
 
         return per_step_rewards
@@ -622,15 +623,10 @@ class CassieEnv(mjx_env.MjxEnv):
         Returns:
             Reward in [0, 1] based on how well CoM is centered over support.
         """
-        # Get foot positions (x, y coordinates only)
         left_foot_pos = data.xpos[self._left_foot_id, :2]  # (2,)
         right_foot_pos = data.xpos[self._right_foot_id, :2]  # (2,)
         
-        # Compute center of support polygon (midpoint between feet)
         support_center = (left_foot_pos + right_foot_pos) / 2.0
-        
-        # Get CoM position (x, y only) - using subtree_com for pelvis
-        # MuJoco's subtree_com gives CoM in world coordinates
         pelvis_com = data.subtree_com[self._pelvis_id, :2]
         
         # Distance from CoM projection to support center
@@ -647,9 +643,28 @@ class CassieEnv(mjx_env.MjxEnv):
         
         # Exponential reward: high when CoM is centered, drops off as it moves toward edges
         # Scale factor of 2.0 means reward ~0.37 when CoM is at half the foot separation
-        reward = jnp.exp(-2.0 * normalized_dist)
+        reward = jnp.exp(-2.5 * normalized_dist)
         
         return jnp.clip(reward, 0.0, 1.0)
+    
+    def _cost_feet_separation(self, data: mjx.Data) -> jax.Array:
+        """Cost for feet being too close or too far apart when on the ground."""
+        both_feet_contact = jnp.logical_and(
+            self._left_foot_height(data) < FOOT_CONTACT_THRESHOLD,
+            self._right_foot_height(data) < FOOT_CONTACT_THRESHOLD
+        )
+        left_foot_pos = data.xpos[self._left_foot_id, :2]  # (2,)
+        right_foot_pos = data.xpos[self._right_foot_id, :2]  # (2,)
+        
+        foot_separation = jnp.linalg.norm(left_foot_pos - right_foot_pos)
+        
+        desired_separation = 0.268  # meters
+        scale = 0.04
+
+        cost = jnp.square((foot_separation - desired_separation) / scale)
+        cost = jnp.clip(cost, 0.0, 1.0)
+
+        return jnp.where(both_feet_contact, cost, 0.0)  # Cost is only applied when both feet are on the ground
 
     def _get_termination(self, data: mjx.Data, step: jax.Array) -> jax.Array:
         """Return True if Cassie has fallen or max timesteps reached."""

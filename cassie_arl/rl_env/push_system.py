@@ -32,11 +32,18 @@ class PushState:
     rng: jax.Array  # RNG state for push generation
     
     @classmethod
-    def init(cls, rng: jax.Array, start_time: float = 0.0) -> "PushState":
+    def init(cls, rng: jax.Array, interval_range: jax.Array) -> "PushState":
         """Initialize push state."""
+        rng, key = jax.random.split(rng)
+        first_push_time = jax.random.uniform(
+            key,
+            (),
+            minval=interval_range[0],
+            maxval=interval_range[1]
+        )
         return cls(
             last_push_time=jnp.array(-jnp.inf),
-            next_push_time=jnp.array(start_time),
+            next_push_time=first_push_time,
             is_pushing=jnp.array(False),
             push_end_time=jnp.array(-jnp.inf),
             current_force=jnp.zeros(6),

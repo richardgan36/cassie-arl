@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 FALLING_THRESHOLD = 0.55
 TARSUS_HIT_GROUND_THRESHOLD = 0.1  # Height (m) below which tarsus is considered to have hit ground
-FOOT_CONTACT_THRESHOLD = 0.01  # Height (m) below which foot is considered to be in contact with ground
+FOOT_CONTACT_THRESHOLD = 0.015  # Height (m) below which foot is considered to be in contact with ground
 FOOT_OFFSET = 0.057  # Height (m) of foot from ground when standing
 
 

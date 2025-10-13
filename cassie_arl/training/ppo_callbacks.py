@@ -28,7 +28,6 @@ logging.set_verbosity(logging.INFO)
 
 class ProgressCallback:
     """Callable progress callback for Brax PPO training loop."""
-    # TODO: add mean episode length metric
     def __init__(
             self,
             num_timesteps: dict,
@@ -53,25 +52,27 @@ class ProgressCallback:
         self.y_data.append(metrics["eval/episode_reward"])
         self.y_dataerr.append(metrics["eval/episode_reward_std"])
 
-        mean_episode_length = metrics.get("eval/episode_length", None)
-
         print("")
         logging.info("--- Progress update ---")
         logging.info(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        logging.info(
+            f"Steps: {num_steps}, Reward: {self.y_data[-1]:.3f} "
+            f"± {self.y_dataerr[-1]:.3f}"
+        )
+        logging.info(
+            f"Episode length: {metrics["eval/avg_episode_length"]:.2f} "
+            f"± {metrics["eval/std_episode_length"]:.2f}"
+        )
+        logging.info(f"Entropy loss: {metrics["training/entropy_loss"]:.6f}")
+        logging.info(f"Policy loss: {metrics["training/policy_loss"]:.6f}")
+        logging.info(f"Value loss: {metrics["training/v_loss"]:.6f}")
 
-        if len(self.times) == 2:
-            time_to_jit = self.times[-1] - self.times[0]
-            logging.info(f"Steps: {num_steps}, Reward: {self.y_data[-1]:.3f} ± {self.y_dataerr[-1]:.3f}")
-            logging.info(f"Time to jit: {time_to_jit}")
-        else:
+        if len(self.times) > 2:
             delta = self.times[-1] - self.times[-2]
             last_step = self.x_data[-2] if len(self.x_data) >= 2 else None
-            logging.info(f"Steps: {num_steps}, Reward: {self.y_data[-1]:.3f} ± {self.y_dataerr[-1]:.3f}")
-            logging.info(f"Time since last progress call (steps {last_step} -> {num_steps}): {delta}")
-
-        if mean_episode_length is not None:
-            logging.info(f"Mean Episode Length: {mean_episode_length:.3f}")
-
+            logging.info(
+                f"\nTime since last progress call (steps {last_step} -> {num_steps}): {delta}"
+            )
         print("-----------------")
 
         plt.clf()  # Clear the current figure
@@ -113,6 +114,8 @@ class VisualizePolicyCallback:
         right_foot_z: float
         left_tarsus_z: float
         right_tarsus_z: float
+        foot_separation_xy: float  # Distance between feet in XY plane
+        com_to_support_center: float  # Distance from CoM to center of support polygon
 
     @dataclass
     class RolloutData:
@@ -288,11 +291,30 @@ class VisualizePolicyCallback:
     def _record_feet(self, state, data: 'VisualizePolicyCallback.RolloutData'):
         left_foot_z = float(np.array(state.data.xpos[self.env._left_foot_id, 2])) - FOOT_OFFSET
         right_foot_z = float(np.array(state.data.xpos[self.env._right_foot_id, 2])) - FOOT_OFFSET
+        
+        # Get foot positions in XY plane
+        left_foot_pos = np.array(state.data.xpos[self.env._left_foot_id, :2])  # (2,)
+        right_foot_pos = np.array(state.data.xpos[self.env._right_foot_id, :2])  # (2,)
+        
+        # Calculate foot separation in XY plane
+        foot_separation_xy = float(np.linalg.norm(left_foot_pos - right_foot_pos))
+        
+        # Calculate support center (midpoint between feet)
+        support_center = (left_foot_pos + right_foot_pos) / 2.0
+        
+        # Get CoM position (XY only) - using subtree_com for pelvis
+        pelvis_com_xy = np.array(state.data.subtree_com[self.env._pelvis_id, :2])
+        
+        # Calculate distance from CoM to support center
+        com_to_support_center = float(np.linalg.norm(pelvis_com_xy - support_center))
+        
         fi = self.FootInfo(
             left_foot_z=left_foot_z,
             right_foot_z=right_foot_z,
             left_tarsus_z=float(np.array(state.data.xpos[self.env._left_tarsus_id, 2])),
             right_tarsus_z=float(np.array(state.data.xpos[self.env._right_tarsus_id, 2])),
+            foot_separation_xy=foot_separation_xy,
+            com_to_support_center=com_to_support_center,
         )
         data.foot_infos.append(fi)
 
@@ -345,7 +367,7 @@ class VisualizePolicyCallback:
 
             # Tilt quaternion and derived RPY
             qw, qx, qy, qz = obs_data[1:5]
-            lines.append(f"Tilt quat: [{qw:.3f}, {qx:.3f}, {qy:.3f}, {qz:.3f}]")
+            lines.append(f"Tilt quat: [{qw:.2f}, {qx:.2f}, {qy:.2f}, {qz:.2f}]")
             import math
             sinr_cosp = 2 * (qw * qx + qy * qz)
             cosr_cosp = 1 - 2 * (qx * qx + qy * qy)
@@ -367,7 +389,7 @@ class VisualizePolicyCallback:
             lines.append(f"Ang vel [x,y,z]: [{ang_vel[0]:.2f}, {ang_vel[1]:.2f}, {ang_vel[2]:.2f}]")
 
             # Foot heights
-            lines.append("--- Foot Heights ---")
+            lines.append("--- Foot Info ---")
             lines.append(f"L foot z: {foot.left_foot_z:.3f} m")
             lines.append(f"R foot z: {foot.right_foot_z:.3f} m")
             # Foot contacts from observation (indices 31:33)
@@ -378,6 +400,11 @@ class VisualizePolicyCallback:
                 lines.append(f"Contacts: L={l_contact}  R={r_contact}")
             except Exception:
                 pass
+            
+            # Add foot separation and CoM stability metrics
+            lines.append("--- Stability Metrics ---")
+            lines.append(f"Foot separation: {foot.foot_separation_xy:.3f} m")
+            lines.append(f"CoM to support: {foot.com_to_support_center:.3f} m")
         except Exception:
             # Fallback minimal info if parsing fails
             lines = ["Observations: parse error"]
@@ -393,7 +420,7 @@ class VisualizePolicyCallback:
         for name, weighted_value in reward_record.components.items():
             scale = reward_scales.get(name, 1.0)
             raw_value = weighted_value / scale if scale != 0 else 0.0
-            lines.append(f"{name}: {raw_value * scale:.4f}")
+            lines.append(f"{name}: {raw_value * scale:.3f}")
         return lines
 
     # ----------------------------- Saving Artifacts ------------------------------
@@ -419,12 +446,11 @@ class VisualizePolicyCallback:
 
         # Pre-create scene option once
         scene_option = mj.MjvOption()
-        scene_option.geomgroup[1] = True  # Show frames?
         scene_option.geomgroup[2] = True
         scene_option.geomgroup[3] = False
         scene_option.flags[mj.mjtVisFlag.mjVIS_CONTACTPOINT] = True
         scene_option.flags[mj.mjtVisFlag.mjVIS_CONTACTFORCE] = False
-        scene_option.flags[mj.mjtVisFlag.mjVIS_COM] = True
+        scene_option.flags[mj.mjtVisFlag.mjVIS_COM] = False
         scene_option.flags[mj.mjtVisFlag.mjVIS_TRANSPARENT] = False
         scene_option.flags[mj.mjtVisFlag.mjVIS_PERTFORCE] = True
 
@@ -479,7 +505,7 @@ class VisualizePolicyCallback:
                 try:
                     foot = rollout.foot_infos[i]
                 except Exception:
-                    foot = self.FootInfo(0.0, 0.0, 0.0, 0.0)
+                    foot = self.FootInfo(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
                 try:
                     reward_record = rollout.reward_records[i]
                 except Exception:
@@ -493,7 +519,7 @@ class VisualizePolicyCallback:
                 for li, line in enumerate(left_lines):
                     self._put_text(frame_rgb, line, (10, 30 + li * 30), color=(255, 255, 255), font_scale=font_scale, thickness=thickness)
                 fw = frame_rgb.shape[1]
-                right_x = fw - 390
+                right_x = fw - 380
                 for ri, line in enumerate(right_lines):
                     if (ri < 3) or (':' not in line):
                         color = (255, 255, 255)
