@@ -4,7 +4,7 @@ from pathlib import Path
 import jax
 from jax import numpy as jnp
 
-from cassie_arl.config.cassie_consts import *
+from cassie_arl.cassie_env.cassie_consts import *
 
 
 script_dir = Path(__file__).parent

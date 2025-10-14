@@ -1,12 +1,7 @@
 # Directories
 .venv/
 checkpoints/
-progress/
-simulation/
-
-# Third-party Cassie code
-hybridrobotics/
-icepomel0/
+results/
 
 # Python bytecode
 __pycache__/

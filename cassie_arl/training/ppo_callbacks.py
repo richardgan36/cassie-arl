@@ -15,7 +15,7 @@ from brax.training import types
 import io
 import contextlib
 
-from cassie_arl.config.cassie_consts import (
+from cassie_arl.cassie_env.cassie_consts import (
     FOOT_OFFSET,
     QPosIdx,
     JntRangeIdx
@@ -37,9 +37,8 @@ class ProgressCallback:
         ):
         self.num_timesteps = num_timesteps
         self.script_dir = script_dir
-        self.iteration = iteration
         self.save_plot = save_plot
-        self.save_dir = self.script_dir / "progress" / train_id
+        self.save_dir = self.script_dir / "results" / "cassie" / train_id / f"iter_{iteration:02d}"
         self.x_data = []
         self.y_data = []
         self.y_dataerr = []
@@ -113,7 +112,7 @@ class ProgressCallback:
             plt.pause(0.005)  # Small pause to update the figure
             return
 
-        save_path = self.save_dir / f"progress_{self.iteration:02d}.png"
+        save_path = self.save_dir / f"progress.png"
         save_path.parent.mkdir(parents=True, exist_ok=True)
         plt.savefig(str(save_path), dpi=150, bbox_inches="tight")
 
@@ -188,7 +187,7 @@ class VisualizePolicyCallback:
 
         # Centralized directory for all visualization artifacts
         # Keeping the same path as before for backward compatibility
-        self.ani_save_dir = self.script_dir / "simulation" / train_id / f"iter_{iteration:02d}"
+        self.ani_save_dir = self.script_dir / "results" / "cassie" / train_id / f"iter_{iteration:02d}"
         if self.test_mode:
             self.ani_save_dir = self.ani_save_dir / "test"
         self.ani_save_dir.mkdir(parents=True, exist_ok=True)
