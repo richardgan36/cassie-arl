@@ -8,7 +8,7 @@ from cassie_arl.cassie_env.cassie_consts import *
 
 
 script_dir = Path(__file__).parent
-CASSIE_SCENE_XML = script_dir / ".." / "models" / "scene.xml"
+CASSIE_SCENE_XML = script_dir / ".." / ".." / "models" / "scene.xml"
 
 model = mj.MjModel.from_xml_path(CASSIE_SCENE_XML.as_posix())
 data = mj.MjData(model)
@@ -94,4 +94,8 @@ def geoms_of_body(model, body_id):
 
 # print(mjx_data._impl.contact.frame)
 
-print(model.body("com_marker").id)
+# print(model.body("com_marker").id)
+
+
+init_qpos = model.keyframe("home").qpos
+print(init_qpos[QPosIdx.MOTORS])

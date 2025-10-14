@@ -10,32 +10,26 @@ from absl import logging
 from mujoco_playground import wrapper
 from orbax import checkpoint as ocp
 
-from cassie_arl.cassie_env.cassie_env import CassieEnv
+from cassie_arl.cassie_env.cassie_env import CassieEnv, default_config
 from cassie_arl.cassie_env.domain_randomization import domain_randomize
-from cassie_arl.adversary_env.adversary_env import AdversaryEnv
 from cassie_arl.training.ppo_callbacks import ProgressCallback, VisualizePolicyCallback
 
 
 script_dir = Path(__file__).parent.resolve()
 logging.set_verbosity(logging.INFO)
 
-train_id = "active_recovery"
-iteration = 2
+train_id = "dr_baseline"
+iteration = 1
 test_mode = False
 
-use_domain_randomization = False
-
-# Optional: Load a frozen adversary policy for adversarial training
-# Set to None during first training (learning to stand)
-adversary_checkpoint_path = None  # Example: script_dir / "checkpoints/adversary/initial/iter_03/..."
+# Domain randomization baseline: no pushes, no adversary, only domain randomization
+use_domain_randomization = True
 
 network_factory_params = {
     "policy_hidden_layer_sizes": (512, 256, 128),
     "policy_obs_key": "state",  # Policy uses noisy observations
     "value_hidden_layer_sizes": (512, 256),
     "value_obs_key": "privileged_state",  # Critic uses noiseless privileged state
-    # "init_noise_std": 2.0,          # Added to increase exploration
-    # "state_dependent_std": True,    # Added to increase exploration
 }
 
 ppo_training_params = {
@@ -43,7 +37,7 @@ ppo_training_params = {
     'batch_size': 2048,
     'clipping_epsilon': 0.2,
     'discounting': 0.97,
-    'entropy_cost': 0.005,  # Increased initially to encourage exploration. TODO: anneal down to 0?
+    'entropy_cost': 0.005,
     'episode_length': 1024,
     'learning_rate': 3e-4,
     'max_grad_norm': 1.0,
@@ -60,72 +54,20 @@ ppo_training_params = {
 }
 
 
-def load_adversary_policy(checkpoint_path: Path):
-    """
-    Load a trained adversary policy from Orbax checkpoint.
-    
-    Args:
-        checkpoint_path: Path to the checkpoint directory
-        
-    Returns:
-        A frozen policy function (obs, rng) -> (action, extra)
-    """
-    logging.info(f"Loading adversary policy from {checkpoint_path}")
-    checkpointer = ocp.PyTreeCheckpointer()
-    params = checkpointer.restore(checkpoint_path)
-    
-    # Create a temporary adversary env to get observation and action sizes
-    # We need a dummy Cassie policy for this
-    def dummy_cassie_policy(obs, rng):
-        return jax.numpy.zeros(10), {}
-    
-    temp_env = AdversaryEnv(
-        cassie_policy_fn=dummy_cassie_policy,
-    )
-    
-    # Recreate the network with normalization settings used during adversary training
-    normalize_fn = running_statistics.normalize
-    
-    network_factory = functools.partial(
-        ppo_networks.make_ppo_networks,
-        policy_hidden_layer_sizes=(256, 128, 64),
-        value_hidden_layer_sizes=(512, 256),
-    )
-    
-    network = network_factory(
-        observation_size=temp_env.observation_size,
-        action_size=temp_env.action_size,
-        preprocess_observations_fn=normalize_fn,
-    )
-    
-    normalizer_dict, policy_params, value_params = params
-    normalizer_params = running_statistics.RunningStatisticsState(
-        mean=normalizer_dict['mean'],
-        std=normalizer_dict['std'],
-        count=normalizer_dict['count'],
-        summed_variance=normalizer_dict['summed_variance']
-    )
-    
-    params_with_normalizer = [normalizer_params, policy_params, value_params]
-    
-    make_policy = ppo_networks.make_inference_fn(network)
-    policy_fn = make_policy(params_with_normalizer, deterministic=False)
-    
-    logging.info("Successfully loaded adversary policy")
-    
-    return policy_fn
-
-
 def main():
-    # Load adversary policy if checkpoint provided
-    adversary_policy_fn = None
-    if adversary_checkpoint_path is not None:
-        adversary_policy_fn = load_adversary_policy(adversary_checkpoint_path)
-        logging.info("Adversary policy loaded - will use adversarial wrenches during training")
-    else:
-        logging.info("No adversary policy - will use only random pushes (if enabled)")
+    config = default_config()
+    config.push_config.enabled = False  # Disable random pushes for baseline
     
-    env = CassieEnv(adversary_policy_fn=adversary_policy_fn)
+    logging.info("="*60)
+    logging.info("BASELINE TRAINING: Domain Randomization Only")
+    logging.info("="*60)
+    logging.info("Configuration:")
+    logging.info(f"  - Random pushes: DISABLED")
+    logging.info(f"  - Adversary: DISABLED")
+    logging.info(f"  - Domain randomization: ENABLED")
+    logging.info("="*60 + "\n")
+    
+    env = CassieEnv(config=config, adversary_policy_fn=None)
 
     jit_step = jax.jit(env.step)
     jit_reset = jax.jit(env.reset)
@@ -186,19 +128,14 @@ def main():
     if "save_checkpoint_path" in train_fn.keywords and train_fn.keywords["save_checkpoint_path"] is not None:
         logging.info(f"Checkpoints will be saved to {train_fn.keywords['save_checkpoint_path']}")
 
-    logging.info("\n" + "="*50 + "\nStarting Cassie training\n" + "="*50 + "\n")
+    logging.info("\n" + "="*50 + "\nStarting Cassie baseline training\n" + "="*50 + "\n")
 
-    # Configure domain randomization
     randomization_fn = domain_randomize if use_domain_randomization else None
-    if use_domain_randomization:
-        logging.info("Domain randomization enabled - physical parameters will be randomized")
-    else:
-        logging.info("Domain randomization disabled - using default physical parameters")
 
     # Start training
     make_inference_fn, params, metrics = train_fn(
         environment=env,
-        eval_env=CassieEnv(adversary_policy_fn=adversary_policy_fn),
+        eval_env=CassieEnv(config=config, adversary_policy_fn=None),
         wrap_env_fn=wrapper.wrap_for_brax_training,
         randomization_fn=randomization_fn,
     )
@@ -208,4 +145,8 @@ def main():
     else:
         logging.info("Time to train: not enough progress timestamps available")
 
-    logging.info("\nCassie training completed!")
+    logging.info("\nCassie baseline training completed!")
+
+
+if __name__ == "__main__":
+    main()

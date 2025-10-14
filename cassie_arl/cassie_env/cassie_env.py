@@ -1,4 +1,4 @@
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union, Callable
 from pathlib import Path
 
 import jax
@@ -10,7 +10,7 @@ from ml_collections import config_dict
 from mujoco_playground._src import mjx_env
 
 import cassie_arl.cassie_env.math_utils as math_utils
-from cassie_arl.cassie_env.push_system import PushSystem, PushState, apply_wrench_to_body
+from cassie_arl.cassie_env.push_system import PushSystem, PushState, AdversarySystem, AdversaryState, apply_wrench_to_body
 from cassie_arl.cassie_env.cassie_consts import (
     FOOT_OFFSET,
     TARSUS_HIT_GROUND_THRESHOLD,
@@ -38,8 +38,8 @@ def default_config() -> config_dict.ConfigDict:
         # Custom parameters
         # -------------------
 
-        # Number of previous steps to include in the observation history.
-        # Total stacked timesteps in obs = history_len + 1 (t plus history)
+        # Full observation consists of stacked frames of
+        # t, t-1, ..., t-history_len
         history_len=2,
 
         # --- PD control parameters ---
@@ -58,10 +58,10 @@ def default_config() -> config_dict.ConfigDict:
                 xy=jnp.array([-0.1, 0.1]),            # Additive
                 z=jnp.array([0, 0.05]),               # Additive
                 yaw=jnp.array([-3.14, 3.14]),         # Additive
-                roll_pitch=jnp.array([-0.1, 0.1]),  # Additive
+                roll_pitch=jnp.array([-0.1, 0.1]),    # Additive
                 motors=jnp.array([-0.07, 0.07]),      # Multiplicative: Motors *= U(1-0.07, 1+0.07)
                 dxyz=jnp.array([-0.3, 0.3]),          # Additive
-                drpy=jnp.array([-0.2, 0.2]),        # Additive
+                drpy=jnp.array([-0.2, 0.2]),          # Additive
             ),
         ),
 
@@ -70,30 +70,30 @@ def default_config() -> config_dict.ConfigDict:
             weights=config_dict.create(
                 alive=0.7,
                 # pelvis_height=-0.0,  # Initially -0.3, but after training, the agent discovers it can get high reward without tracking height closely
-                pelvis_lin_vel=-0.2,  # Reduced from -0.5 to allow recovery motions
-                pelvis_ang_vel=-0.3,  # Reduced from -0.6 to allow recovery motions
-                pelvis_tilt=-0.2,  # The standing pose found by the agent has a slight tilt, so this cost is reduced to avoid penalizing that too much
+                pelvis_lin_vel=-0.2,   # Reduced from -0.5 to allow recovery motions
+                pelvis_ang_vel=-0.3,   # Reduced from -0.6 to allow recovery motions
+                pelvis_tilt=-0.2,      # The standing pose found by the agent has a slight tilt, so this cost is reduced to avoid penalizing that too much
                 # motor_ref_error=-0.0,  # Initially -0.8 but removed because the agent learnt a standing pose that is different from the reference pose
-                action_rate=-0.2,  # Reduced from -0.5 to allow faster reactions
+                action_rate=-0.2,      # Reduced from -0.5 to allow faster reactions
                 torques=-0.05,
-                gain_rate=-0.0,  # Set to 0 to allow dynamic gain adjustment during recovery
+                gain_rate=-0.0,        # Set to 0 to allow dynamic gain adjustment during recovery
                 com_stability=1.1,
                 feet_separation=-0.4
             ),
         ),
 
-        # --- Push configuration ---
+        # --- Push configuration (random pushes) ---
         push_config=config_dict.create(
             enabled=True,
             target_body="cassie-pelvis",
             
             force_ranges=config_dict.create(
-                x=jnp.array([20.0, 40.0]),   # Forward/backward
-                y=jnp.array([15.0, 30.0]),     # Left/right
-                z=jnp.array([0.0, 10.0]),     # Up/down
+                x=jnp.array([20.0, 40.0]),
+                y=jnp.array([15.0, 30.0]),
+                z=jnp.array([0.0, 10.0]),
             ),
 
-            # Torque range [min, max] in N⋅m
+            # Torque range [min, max] in N⋅m. Torques are not currently used.
             torque_range=jnp.array([0.0, 0.0]),
             
             # Push timing
@@ -105,19 +105,19 @@ def default_config() -> config_dict.ConfigDict:
 
 class CassieEnv(mjx_env.MjxEnv):
     """Cassie environment built on MJX, compatible with Brax PPO."""
-
     def __init__(
             self,
             xml_path: str = CASSIE_SCENE_XML.as_posix(),
             config: config_dict.ConfigDict = default_config(),
-            config_overrides: Optional[Dict[str, Union[str, int, list[Any]]]] = None
+            config_overrides: Optional[Dict[str, Union[str, int, list[Any]]]] = None,
+            adversary_policy_fn: Optional[Callable[[jax.Array, jax.Array], Tuple[jax.Array, Any]]] = None,
     ):
         super().__init__(config, config_overrides)
-        # Load MuJoCo model and MJX version
         self._xml_path = xml_path
         self._mj_model = mj.MjModel.from_xml_path(self._xml_path)
         self._mjx_model = mjx.put_model(self._mj_model)
 
+        # Required for generating videos without error
         self._mj_model.vis.global_.offwidth = 3840
         self._mj_model.vis.global_.offheight = 2160
         
@@ -126,6 +126,7 @@ class CassieEnv(mjx_env.MjxEnv):
         self._mj_model.vis.scale.framewidth = 0.02  # General frame thickness
         self._mj_model.vis.map.force = 0.05  # Proportional to force arrow length
 
+        self._adversary_policy_fn = adversary_policy_fn
         self._post_init()
 
     def _post_init(self):
@@ -144,7 +145,7 @@ class CassieEnv(mjx_env.MjxEnv):
         self._torque_uppers = jnp.array(self._mj_model.actuator_ctrlrange[:, 1])
 
         # -------------------
-        # Precomputed constants for rewards/costs (avoid repeated pow/div)
+        # Precomputed constants for rewards/costs (for efficiency)
         # -------------------
         # Reference pelvis height
         self._pelvis_height_ref = 0.985
@@ -160,25 +161,18 @@ class CassieEnv(mjx_env.MjxEnv):
         # Per-step scale = max_delta / (0.25 / dt) = max_delta / steps_per_quarter_sec
         steps_per_quarter_sec = jnp.maximum(0.25 / self.dt, 1.0)
         per_step_target_scale = self._max_jnt_deltas / steps_per_quarter_sec  # (10,)
-        # Guard against tiny scales to avoid blow-ups
         per_step_target_scale = jnp.maximum(per_step_target_scale, 1e-6)
         self._inv_action_rate_scales_sq = 1.0 / (per_step_target_scale ** 2)  # (10,)
 
-        # Torque scale is per-actuator; use upper bounds (assumed symmetric)
+        # Torque scale is per-actuator; use upper bounds (torque range is symmetric)
         # cost ~ mean((tau / (ub/2))^2) == mean((tau^2) * (2/ub)^2)
         self._inv_torque_scales_sq = (2.0 / self._torque_uppers) ** 2
 
-        # Gain-rate scales (guarded against 0)
+        # Gain-rate scales
         self._p_gain_rate_scale = jnp.maximum(self._config.max_p_gain / 25.0, 1e-6)
         self._d_gain_rate_scale = jnp.maximum(self._config.max_d_gain / 25.0, 1e-6)
         self._inv_p_gain_rate_scale_sq = jnp.array(1.0 / (self._p_gain_rate_scale ** 2))
         self._inv_d_gain_rate_scale_sq = jnp.array(1.0 / (self._d_gain_rate_scale ** 2))
-
-        # def geoms_of_body(model, body_id):
-        #     start = model.body_geomadr[body_id]
-        #     count = model.body_geomnum[body_id]
-        #     geom_ids = jnp.arange(start, start + count)
-        #     return geom_ids
 
         # MJCF geom and body IDs
         # self._floor_gid = self._mj_model.geom("floor").id
@@ -188,13 +182,20 @@ class CassieEnv(mjx_env.MjxEnv):
         self._left_tarsus_id = self._mj_model.body("left-tarsus").id
         self._right_tarsus_id = self._mj_model.body("right-tarsus").id
 
-        # self._left_foot_gid = geoms_of_body(self._mj_model, self._left_foot_id)
-        # self._right_foot_gid = geoms_of_body(self._mj_model, self._right_foot_id)
-
         # Initialize push system
         push_target_body_name = self._config.push_config.get("target_body", "cassie-pelvis")
         self._push_target_body_id = self._mj_model.body(push_target_body_name).id
         self._push_system = PushSystem(self._config.push_config, self._push_target_body_id)
+        
+        # Initialize adversary system if policy provided
+        adversary_enabled = self._adversary_policy_fn is not None
+        self._adversary_system = AdversarySystem(
+            self._adversary_policy_fn,
+            self._push_target_body_id,  # Apply to same body as pushes
+            self._left_foot_id,
+            self._right_foot_id,
+            enabled=adversary_enabled,
+        )
     
     # ----------------------------------------------------------------------
     # Required abstract methods/properties
@@ -234,38 +235,40 @@ class CassieEnv(mjx_env.MjxEnv):
 
         rng, qpos, qvel = self._add_perturbations(rng, qpos, qvel)
 
-        # Split RNG for push system
         rng, push_rng = jax.random.split(rng)
+        rng, adversary_rng = jax.random.split(rng)
 
         data = mjx_env.init(self._mjx_model, qpos=qpos, qvel=qvel)
-        # Use zeros torques with correct actuator dimension for initial obs
         zero_torques = jnp.zeros((self._mjx_model.nu,))
-        obs_single = self._get_obs(data, zero_torques)
+        
+        zero_wrench = jnp.zeros(6)
+        rng, obs_rng = jax.random.split(rng)
+        obs_single, privileged_obs_single = self._get_obs(data, zero_torques, zero_wrench, obs_rng)
 
         # Initialize history buffer with the initial observation repeated
         hist_len = int(self._config.history_len) + 1  # t plus previous steps
         obs_history = jnp.tile(obs_single[None, :], (hist_len, 1))
+        privileged_obs_history = jnp.tile(privileged_obs_single[None, :], (hist_len, 1))
         obs = obs_history.reshape(-1)
+        privileged_obs = privileged_obs_history.reshape(-1)
 
-        # Initialize push state
         push_state = PushState.init(push_rng, self._config.push_config.interval_range)
+        adversary_state = AdversaryState.init(adversary_rng)
 
         info = {
             "rng": rng,
             "step": 0,
             "pos_targets": jnp.zeros((self._mjx_model.nu,)),
-            # Store last per-joint PD gains to compute gain-rate cost
             "last_p_gains": jnp.zeros((self._mjx_model.nu,)),
             "last_d_gains": jnp.zeros((self._mjx_model.nu,)),
-            # Rolling observation history buffer of shape (history_len+1, obs_dim)
             "obs_history": obs_history,
-            # Push state
+            "privileged_obs_history": privileged_obs_history,
             "push_state": push_state,
+            "adversary_state": adversary_state,
+            "last_wrench": zero_wrench,
         }
         
         # Initialize metrics with reward components (all zeros at reset)
-        # Always include a 'reward' metric to keep the pytree structure
-        # constant across training and action repeats.
         metrics = {
             **{
                 f"reward_component/{k}": jnp.zeros(())
@@ -287,7 +290,7 @@ class CassieEnv(mjx_env.MjxEnv):
 
         return mjx_env.State(
             data=data,
-            obs=obs,
+            obs={"state": obs, "privileged_state": privileged_obs},
             reward=jnp.zeros(()),
             done=jnp.zeros(()),
             metrics=metrics,
@@ -317,6 +320,18 @@ class CassieEnv(mjx_env.MjxEnv):
             base_quat
         )
         
+        # Update adversary system and get adversary wrench
+        adversary_state, adversary_wrench = self._adversary_system.update(
+            state.info["adversary_state"],
+            state.data,
+            self._standing_jnt_angles,
+        )
+        
+        # Combine push and adversary wrenches
+        # If both are enabled, add them (adversary dominates if push is disabled)
+        # Usually, use one or the other, not both simultaneously
+        total_wrench = push_wrench + adversary_wrench
+        
         # Run PD control at simulator substep frequency (sim_dt):
         # Hold pos_targets and gains constant within this control interval,
         # but recompute torques each substep using the latest q, qdot.
@@ -325,12 +340,12 @@ class CassieEnv(mjx_env.MjxEnv):
             tau = self._pd_control(data_carry, pos_targets, p_gains, d_gains)
             tau = jnp.clip(tau, self._torque_lowers, self._torque_uppers)
             
-            # Apply push force using the push system
+            # Apply combined wrench (push + adversary)
             data_next = apply_wrench_to_body(
                 self._mjx_model,
                 data_carry,
                 self._push_target_body_id,
-                push_wrench,
+                total_wrench,
             )
             data_next = mjx_env.step(self._mjx_model, data_next, tau, 1)
             return (data_next, tau)
@@ -343,12 +358,20 @@ class CassieEnv(mjx_env.MjxEnv):
         )
 
         # Build single-step obs, then update the rolling history buffer
-        obs_single = self._get_obs(data, torques)
+        rng, obs_rng = jax.random.split(rng)
+        obs_single, privileged_obs_single = self._get_obs(data, torques, total_wrench, obs_rng)
+        
         hist = state.info["obs_history"]
+        privileged_hist = state.info["privileged_obs_history"]
+        
         # Prepend newest obs and drop the oldest for most-recent-first ordering
         new_hist = hist.at[1:].set(hist[:-1])
         new_hist = new_hist.at[0].set(obs_single)
         obs = new_hist.reshape(-1)
+        
+        new_privileged_hist = privileged_hist.at[1:].set(privileged_hist[:-1])
+        new_privileged_hist = new_privileged_hist.at[0].set(privileged_obs_single)
+        privileged_obs = new_privileged_hist.reshape(-1)
 
         per_step_raw = self._get_reward(
                             data,
@@ -359,10 +382,7 @@ class CassieEnv(mjx_env.MjxEnv):
                             d_gains,
                         )
 
-        # Scale each component by its configured weight
         per_step_weighted = {k: per_step_raw[k] * self._config.reward_config.weights[k] for k in per_step_raw}
-
-        # Per-step components are integrated over dt
         reward = jnp.sum(jnp.array(list(per_step_weighted.values()))) * self.dt
 
         new_step = state.info.get("step", 0) + 1
@@ -378,12 +398,13 @@ class CassieEnv(mjx_env.MjxEnv):
             "last_p_gains": p_gains,
             "last_d_gains": d_gains,
             "obs_history": new_hist,
+            "privileged_obs_history": new_privileged_hist,
             "push_state": push_state,
+            "adversary_state": adversary_state,
+            "last_wrench": total_wrench,
         }
         
-        # Add reward components to metrics for aggregation during evaluation
-        # Brax automatically computes mean and std across eval episodes
-        # Always include the scalar 'reward' so metrics pytree structure is stable.
+        # Add reward components to metrics for evaluation/analysis
         metrics = {
             **{f"reward_component/{k}": v for k, v in per_step_weighted.items()},
             "reward": reward,  # Brax training wrappers expect a 'reward' metric present.
@@ -391,21 +412,30 @@ class CassieEnv(mjx_env.MjxEnv):
         
         return state.replace(
             data=data,
-            obs=obs,
+            obs={"state": obs, "privileged_state": privileged_obs},
             reward=reward,
             done=done,
             metrics=metrics,
             info=new_info
         )
 
-    def _get_obs(self, data: mjx.Data, last_torques: jax.Array) -> jax.Array:
-        """Constructs observation from mjx.Data (Cassie)."""
-        # TODO: separate "state" and "privileged state"
-        # TODO: consider adding foot forces
-        # TODO: consider adding dual history architecture (Z Li). Probably not all
-        #       that useful right now because state is relatively Markovian. But may
-        #       be useful later when noise and external pushes are added.
-
+    def _get_obs(self, data: mjx.Data, last_torques: jax.Array, applied_wrench: jax.Array, rng: jax.Array) -> Tuple[jax.Array, jax.Array]:
+        """Constructs both noisy and privileged observations from mjx.Data (Cassie).
+        
+        Computes observations once and adds Gaussian noise to create the noisy version
+        for the policy, while keeping the noiseless version for the critic.
+        
+        Args:
+            data: MJX data
+            last_torques: Applied motor torques for Cassie from previous step
+            applied_wrench: 6D wrench [fx, fy, fz, tx, ty, tz] applied to the body
+            rng: Random key for generating noise
+        
+        Returns:
+            Tuple of (noisy_obs, privileged_obs) where:
+            - noisy_obs: Observation with sensor noise for the policy
+            - privileged_obs: Noiseless observation for the critic (includes applied wrench)
+        """
         # Base orientation (world->body quaternion in MuJoCo convention)
         base_quat = data.qpos[QPosIdx.BASE_QUAT]
 
@@ -415,25 +445,25 @@ class CassieEnv(mjx_env.MjxEnv):
 
         pelvis_height = data.qpos[QPosIdx.BASE_HEIGHT]
 
-        # Joint positions / velocities
+        # Joint positions / velocities (no noise added to proprioceptive measurements)
         motor_qpos = data.qpos[QPosIdx.MOTORS]
         motor_qvel = data.qvel[QVelIdx.MOTORS]
 
-        # World-frame linear & angular velocities
         lin_vel_world = data.qvel[QVelIdx.BASE_LIN_VEL]
         ang_vel_body = data.qvel[QVelIdx.BASE_ANG_VEL]  # Angular velocity is already in body frame
 
-        # Rotate world velocities into body frame
         lin_vel_body = math_utils.vec_world_to_body(base_quat, lin_vel_world)
+        
         # Use difference between current motor angles and the standing pose
         motor_qpos_delta = motor_qpos - self._standing_jnt_angles
 
-        # Foot contacts (approximate, based on foot height)
         left_foot_contact = self._left_foot_height(data) < FOOT_CONTACT_THRESHOLD
         right_foot_contact = self._right_foot_height(data) < FOOT_CONTACT_THRESHOLD
         feet_contact = jnp.array([left_foot_contact, right_foot_contact], dtype=jnp.float32)
 
-        obs = jnp.concatenate([
+        # Construct privileged (noiseless) observation
+        # Includes applied wrench for critic's advantage
+        privileged_obs = jnp.concatenate([
             pelvis_height,
             tilt_quat,
             motor_qpos_delta,
@@ -441,10 +471,40 @@ class CassieEnv(mjx_env.MjxEnv):
             ang_vel_body,
             motor_qvel,
             feet_contact,
+            last_torques,
+            applied_wrench  # 6D wrench [fx, fy, fz, tx, ty, tz]
+        ])
+        
+        # Create noisy observations for the actor
+        # Noise only affects: pelvis height, orientation, linear velocity, angular velocity
+        # since encoders have negligible noise.
+        rng, key = jax.random.split(rng)
+        height_noise = jax.random.normal(key, shape=(1,)) * 0.01  # 0.01 m std
+        
+        rng, key = jax.random.split(rng)
+        rpy_noise = jax.random.normal(key, shape=(3,)) * 0.02  # 0.02 rad std per axis
+        rpy_noisy = rpy + rpy_noise
+        tilt_quat_noisy = math_utils.euler2quat(jnp.array([rpy_noisy[0], rpy_noisy[1], 0.0]))
+        
+        rng, key = jax.random.split(rng)
+        lin_vel_noise = jax.random.normal(key, shape=(3,)) * 0.05  # 0.05 m/s std
+        
+        rng, key = jax.random.split(rng)
+        ang_vel_noise = jax.random.normal(key, shape=(3,)) * 0.05  # 0.05 rad/s std
+
+        # Construct noisy observation
+        noisy_obs = jnp.concatenate([
+            pelvis_height + height_noise,
+            tilt_quat_noisy,
+            motor_qpos_delta,
+            lin_vel_body + lin_vel_noise,
+            ang_vel_body + ang_vel_noise,
+            motor_qvel,
+            feet_contact,
             last_torques
         ])
 
-        return obs
+        return noisy_obs, privileged_obs
 
     def _get_reward(
             self,
@@ -455,8 +515,7 @@ class CassieEnv(mjx_env.MjxEnv):
             p_gains: jax.Array,
             d_gains: jax.Array,
         ) -> Dict[str, jax.Array]:
-        """
-        Computes reward components.
+        """Computes reward components.
 
         All rewards/costs are in [0, 1]. Their weights in self._config.reward_config.weights
         determine their relative importance and sign.
@@ -496,7 +555,6 @@ class CassieEnv(mjx_env.MjxEnv):
     def _cost_pelvis_height(self, data: mjx.Data) -> jax.Array:
         """Cost for pelvis height deviation from standing height."""
         pelvis_height = data.qpos[QPosIdx.BASE_HEIGHT]  # Shape (1,)
-        # Use reference standing height computed in _post_init
         height_err = pelvis_height - self._pelvis_height_ref
         # (err / s)^2 == err^2 * (1/s^2)
         cost = (height_err[0] ** 2) * self._inv_height_err_scale_sq
@@ -517,7 +575,6 @@ class CassieEnv(mjx_env.MjxEnv):
 
     def _cost_pelvis_tilt(self, data: mjx.Data) -> jax.Array:
         """Cost for pelvis orientation (deviation from standing)."""
-        # Get base quaternion
         base_quat = data.qpos[QPosIdx.BASE_QUAT]
         rpy = math_utils.quat2euler(base_quat)
 
@@ -527,12 +584,10 @@ class CassieEnv(mjx_env.MjxEnv):
         # Mean squared error, normalized
         # (err / s)^2 == err^2 * (1/s^2)
         orientation_cost = jnp.mean((orientation_err ** 2)) * self._inv_tilt_err_scale_sq
-
-        # Clip to [0,1]
         return jnp.clip(orientation_cost, 0.0, 1.0)
 
     def _cost_motor_reference_error(self, data: mjx.Data) -> jax.Array:
-        """Cost for deviation of the motor angles from reference standing pose."""
+        """Cost for deviation of the motor angles from nominal standing pose."""
         motor_qpos = data.qpos[QPosIdx.MOTORS]
         err = motor_qpos - self._standing_jnt_angles
         cost = jnp.mean((err ** 2)) * self._inv_motor_ref_err_scale_sq
@@ -543,7 +598,7 @@ class CassieEnv(mjx_env.MjxEnv):
         
         The 'action' here is interpreted as the target joint angles.
         """
-        # Normalize per joint by the "allowed" per-step change and average
+        # Normalize per joint by the 'allowed' per-step change and average
         act_rate = pos_targets - last_pos_targets  # (10,)
         cost = jnp.mean((act_rate ** 2) * self._inv_action_rate_scales_sq)
         return jnp.clip(cost, 0.0, 1.0)
@@ -583,7 +638,7 @@ class CassieEnv(mjx_env.MjxEnv):
         (stepping, shifting weight) to regain balance.
         
         Returns:
-            Reward in [0, 1] based on how well CoM is centered over support.
+            Reward in [0, 1] based on how close CoM is to center of support.
         """
         left_foot_pos = data.xpos[self._left_foot_id, :2]  # (2,)
         right_foot_pos = data.xpos[self._right_foot_id, :2]  # (2,)
@@ -595,18 +650,15 @@ class CassieEnv(mjx_env.MjxEnv):
         com_offset = pelvis_com - support_center
         com_dist = jnp.linalg.norm(com_offset)
         
-        # Also compute foot separation to normalize the reward
+        # Compute foot separation to normalize the reward
         foot_separation = jnp.linalg.norm(left_foot_pos - right_foot_pos)
         
-        # Reward is high when CoM is within the support polygon
-        # Normalize by foot separation so reward scale adapts to stance width
-        # Target: CoM should be within ~0.5 * foot_separation of center
-        normalized_dist = com_dist / (foot_separation + 0.01)  # Add small constant to avoid division by zero
+        # Normalize by foot separation to be stance invariant
+        normalized_dist = com_dist / (foot_separation + 0.01)
         
         # Exponential reward: high when CoM is centered, drops off as it moves toward edges
         # Scale factor of 2.5 means reward ~0.37 when CoM is at 1/2.5 the foot separation
         reward = jnp.exp(-2.5 * normalized_dist)
-        
         return jnp.clip(reward, 0.0, 1.0)
     
     def _cost_feet_separation(self, data: mjx.Data) -> jax.Array:
@@ -800,6 +852,3 @@ class CassieEnv(mjx_env.MjxEnv):
 
     def _right_foot_height(self, data: mjx.Data) -> jax.Array:
         return data.xpos[self._right_foot_id, 2] - FOOT_OFFSET
-
-
-

@@ -3,8 +3,7 @@ from jax import numpy as jnp
 
 
 def quat2euler(q: jax.Array) -> jax.Array:
-    """
-    Convert a quaternion [w, x, y, z] to Euler angles (XYZ order, radians) using JAX.
+    """Convert a quaternion [w, x, y, z] to Euler angles (XYZ order, radians).
     
     Args:
         q: jax.Array of shape (..., 4), quaternion [w, x, y, z]
@@ -34,7 +33,7 @@ def quat2euler(q: jax.Array) -> jax.Array:
 
 def euler2quat(euler: jax.Array) -> jax.Array:
     """
-    Convert Euler angles [roll, pitch, yaw] (XYZ order, radians) to quaternion [w, x, y, z] using JAX.
+    Convert Euler angles [roll, pitch, yaw] (XYZ order, radians) to quaternion [w, x, y, z].
 
     Args:
         euler: jax.Array of shape (..., 3), Euler angles [roll, pitch, yaw] in radians
@@ -100,8 +99,7 @@ def vec_body_to_world(base_quat: jax.Array, v_body: jax.Array) -> jax.Array:
 
 
 def angle_diff(angle1: jax.Array, angle2: jax.Array) -> jax.Array:
-    """
-    Compute the wrapped difference between two angles in radians.
+    """Compute the wrapped difference between two angles in radians.
     Wraps the result to [-pi, pi].
 
     Args:
@@ -116,8 +114,7 @@ def angle_diff(angle1: jax.Array, angle2: jax.Array) -> jax.Array:
 
 
 def quat2mat(quat: jax.Array) -> jax.Array:
-    """
-    Convert quaternion [w, x, y, z] to a 3x3 rotation matrix R that maps
+    """Convert quaternion [w, x, y, z] to a 3x3 rotation matrix R that maps
     vectors from the base frame to the world frame.
 
     Args:
