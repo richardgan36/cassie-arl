@@ -1,7 +1,7 @@
 # Media
 
 ## Video A: Weight Shift
-https://github.com/richardgan36/cassie-arl/assets/your-user-id/https://github.com/richardgan36/cassie-arl/blob/main/cassie_arl/media/
+https://github.com/richardgan36/cassie-arl/blob/main/cassie_arl/media/weight_shift.mp4
 
 ## Video B: ARL Policy Sliding
 https://github.com/richardgan36/cassie-arl/blob/main/cassie_arl/media/arl_policy_sliding.mp4
