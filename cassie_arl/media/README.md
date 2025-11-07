@@ -4,7 +4,7 @@
 https://github.com/user-attachments/assets/f9523911-b7ae-4d08-a4e4-5d7a679b1b5f
 
 ## Video B: ARL Policy Sliding
-https://github.com/user-attachments/assets/4e7f1742-5041-42d2-8ed6-15b1dc701b22
+https://github.com/user-attachments/assets/5d4f4faa-a09a-49ca-b51e-bfe94135762c
 
 ## Video C: Sideways Force
 https://github.com/user-attachments/assets/328ae03b-838f-4a5a-884c-322f5fab5e89
