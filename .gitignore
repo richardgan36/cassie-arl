@@ -1,12 +1,8 @@
 # Directories
 .venv/
+
 cassie_arl/training/checkpoints/
 cassie_arl/training/results/
-
-
-# Third-party Cassie code
-hybridrobotics/
-icepomel0/
 
 # Python bytecode
 __pycache__/

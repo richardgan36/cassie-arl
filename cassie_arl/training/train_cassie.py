@@ -9,7 +9,7 @@ import jax
 from absl import logging
 from mujoco_playground import wrapper
 
-from cassie_arl.rl_env.cassie_env import CassieEnv
+from cassie_arl.cassie_env.cassie_env import CassieEnv
 from cassie_arl.training.ppo_callbacks import ProgressCallback, VisualizePolicyCallback
 
 
@@ -77,15 +77,15 @@ if test_mode:
 logging.info("PPO training parameters:")
 logging.info(ppo_training_params)
 
-save_ckpt_dir = script_dir / "checkpoints" / f"{train_id}" / f"iter_{iteration:02d}"
-restore_ckpt_path = script_dir / "checkpoints/active_recovery/iter_01/000043253760"
+save_ckpt_dir = script_dir / "checkpoints" / "cassie" / f"{train_id}" / f"iter_{iteration:02d}"
+restore_ckpt_path = script_dir / "placeholder"
 
 # Instantiate callback objects
 progress_cb = ProgressCallback(
     ppo_training_params["num_timesteps"],
     script_dir,
     train_id,
-    iteration,
+    iteration,self
     save_plot=True)
 
 viz_cb = VisualizePolicyCallback(

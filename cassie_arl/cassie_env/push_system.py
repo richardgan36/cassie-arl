@@ -13,7 +13,7 @@ import mujoco.mjx as mjx
 from flax import struct
 from ml_collections import config_dict
 
-import cassie_arl.rl_env.math_utils as math_utils
+import cassie_arl.cassie_env.math_utils as math_utils
 
 
 @struct.dataclass

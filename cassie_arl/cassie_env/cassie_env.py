@@ -9,9 +9,9 @@ import mujoco.mjx as mjx
 from ml_collections import config_dict
 from mujoco_playground._src import mjx_env
 
-import cassie_arl.rl_env.math_utils as math_utils
-from cassie_arl.rl_env.push_system import PushSystem, PushState, apply_wrench_to_body
-from cassie_arl.config.cassie_consts import (
+import cassie_arl.cassie_env.math_utils as math_utils
+from cassie_arl.cassie_env.push_system import PushSystem, PushState, apply_wrench_to_body
+from cassie_arl.cassie_env.cassie_consts import (
     FOOT_OFFSET,
     TARSUS_HIT_GROUND_THRESHOLD,
     FALLING_THRESHOLD,
