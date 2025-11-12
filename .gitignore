@@ -1,11 +1,9 @@
 # Directories
 .venv/
-checkpoints/
-results/
+
+cassie_arl/training/checkpoints/
+cassie_arl/training/results/
 
 # Python bytecode
 __pycache__/
 *.py[cod]
-
-# Large files
-*.mp4
